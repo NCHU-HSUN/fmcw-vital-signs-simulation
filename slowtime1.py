@@ -71,6 +71,16 @@ def highpass(x: np.ndarray, fs: float, cutoff: float, order: int = 2) -> np.ndar
     return filtfilt(b, a, x)
 
 
+def subtract_common_mode(phase_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    phase_matrix = np.asarray(phase_matrix)
+
+    if phase_matrix.ndim != 2:
+        raise ValueError(f"phase_matrix must be 2-D, but got shape {phase_matrix.shape}")
+
+    common_mode = np.mean(phase_matrix, axis=1, keepdims=True)
+    return phase_matrix - common_mode, common_mode.squeeze()
+
+
 def estimate_bpm(sig: np.ndarray, fs: float, fmin: float, fmax: float) -> Tuple[float, np.ndarray, np.ndarray]:
     #f, pxx = welch(sig, fs=fs, nperseg=min(len(sig), 1200))
     f, pxx = welch(sig, fs=fs, nperseg=len(sig))
@@ -200,8 +210,8 @@ def main() -> None:
     # 人體參數
     Ar = 5e-3               # 呼吸位移振幅 5 mm
     Ah = 0.5e-3             # 心跳位移振幅 0.5 mm
-    hr = 230                # 心跳 bpm
-    rr = 15                 # 呼吸 bpm
+    hr = 122                # 心跳 bpm
+    rr = 93                 # 呼吸 bpm
     fh = hr / 60            # 心跳 Hz
     fr = rr / 60            # 呼吸 Hz
     hmax = 240              # 最大心跳 bpm
@@ -212,6 +222,9 @@ def main() -> None:
     fhrmin = hmin / 60       # 最小心跳 Hz
     frrmax = rmax / 60       # 最大呼吸 Hz
     frrmin = rmin / 60       # 最小呼吸 Hz
+
+    num_bins = 8
+    target_bin_idx = 3
 
     n_trials = 100
     rr_true_values = []
@@ -226,20 +239,32 @@ def main() -> None:
         #fr = rr / 60.0
         #fh = hr / 60.0
 
+        common_drift = 0.5 * np.sin(2 * np.pi * 0.03 * t) + 0.002 * (t - np.mean(t))
+
         # 胸部位移模型
         x = Ar * np.sin(2 * np.pi * fr * t) + Ah * np.sin(2 * np.pi * fh * t)
 
-        # target range bin 的 complex signal
-        A = 1.0
+        # 多 range bins 的 complex signal
         noise_std = 0.05
-        noise = noise_std * (rng.standard_normal(len(t)) + 1j * rng.standard_normal(len(t)))
-        s = A * np.exp(1j * 4 * np.pi * x / lam) + noise
+        s_bins = np.zeros((len(t), num_bins), dtype=complex)
 
-        # phase extraction
-        phase = np.unwrap(np.angle(s))
-        #phase = detrend(phase, type='linear')
+        for bin_index in range(num_bins):
+            motion_scale = 1.0 if bin_index == target_bin_idx else 0.15
+            static_phase = rng.uniform(-np.pi, np.pi)
+            amplitude = 1.0 if bin_index == target_bin_idx else 0.8
+            noise = noise_std * (rng.standard_normal(len(t)) + 1j * rng.standard_normal(len(t)))
+            bin_phase = common_drift + motion_scale * (4 * np.pi * x / lam) + static_phase
+            s_bins[:, bin_index] = amplitude * np.exp(1j * bin_phase) + noise
+
+        # phase extraction + common-mode subtraction across range bins
+        phase_matrix = np.unwrap(np.angle(s_bins), axis=0)
+        phase_matrix_cm_removed, common_mode = subtract_common_mode(phase_matrix)
+        phase_raw = phase_matrix[:, target_bin_idx]
+        phase = phase_matrix_cm_removed[:, target_bin_idx]
+
+        phase = detrend(phase, type='linear')
         phase = phase - np.mean(phase)
-        #phase = highpass(phase, fs_slow, cutoff=0.05)
+        phase = highpass(phase, fs_slow, cutoff=0.05)
 
         # RR
         rr_sig = bandpass(phase, fs_slow, frrmin, frrmax)
@@ -272,7 +297,9 @@ def main() -> None:
         if first_plot_data is None:
             first_plot_data = {
                 'x': x,
+                'phase_raw': phase_raw,
                 'phase': phase,
+                'common_mode': common_mode,
                 'f_rr': f_rr,
                 'p_rr': p_rr,
                 'rr_bpm': rr_bpm,
@@ -312,6 +339,7 @@ def main() -> None:
     fig, axs = plt.subplots(4, 1, figsize=(10, 6))
 
     x = plot_data['x']
+    phase_raw = plot_data['phase_raw']
     phase = plot_data['phase']
     f_rr = plot_data['f_rr']
     p_rr = plot_data['p_rr']
@@ -324,8 +352,10 @@ def main() -> None:
     axs[0].plot(t, x * 1000)
     axs[0].set_title(f"Chest displacement (mm) | RR ref={plot_data['rr_true']:.2f} bpm, HR ref={plot_data['hr_true']:.2f} bpm")
 
-    axs[1].plot(t, phase)
+    axs[1].plot(t, phase_raw, label='Raw target-bin phase', alpha=0.5)
+    axs[1].plot(t, phase, label='CM-removed phase', linewidth=1.5)
     axs[1].set_title("Unwrapped phase")
+    axs[1].legend()
 
     axs[2].plot(f_rr * 60, p_rr, label='PSD')
     axs[2].set_xlabel('RR Frequency (bpm)')
