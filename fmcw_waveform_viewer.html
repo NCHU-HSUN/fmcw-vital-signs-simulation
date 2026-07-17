@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FMCW Waveform Viewer</title>
+  <style>
+    :root {
+      --ink: #102a43;
+      --muted: #627d98;
+      --paper: #f7fbfc;
+      --line: #d9e2ec;
+      --teal: #007c7c;
+      --orange: #d97706;
+      --guard: #e8eef1;
+      --focus: #0f766e;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background:
+        linear-gradient(90deg, rgb(16 42 67 / 4%) 1px, transparent 1px),
+        linear-gradient(rgb(16 42 67 / 4%) 1px, transparent 1px),
+        var(--paper);
+      background-size: 28px 28px;
+      font-family: Georgia, "Times New Roman", serif;
+    }
+
+    main {
+      width: min(1200px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 56px;
+    }
+
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--ink);
+    }
+
+    h1, h2, p { margin: 0; }
+
+    h1 {
+      font-size: 36px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    header p {
+      max-width: 460px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.45;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      margin: 24px 0 28px;
+      border: 1px solid var(--line);
+      background: var(--line);
+    }
+
+    .metric {
+      min-height: 84px;
+      padding: 14px 16px;
+      background: rgb(255 255 255 / 80%);
+    }
+
+    .metric span, .caption, label {
+      display: block;
+      color: var(--muted);
+      font-family: "Trebuchet MS", sans-serif;
+      font-size: 12px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 8px;
+      font-family: "Trebuchet MS", sans-serif;
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    section { margin-top: 34px; }
+
+    .section-title {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 10px;
+    }
+
+    h2 { font-size: 23px; }
+
+    .caption {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: none;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 260px;
+      border: 1px solid var(--line);
+      background: rgb(255 255 255 / 88%);
+    }
+
+    #overviewCanvas { height: 126px; cursor: crosshair; }
+    #captureCanvas { height: 310px; }
+    #rfCanvas { height: 250px; }
+
+    .control {
+      display: grid;
+      grid-template-columns: 110px 1fr 64px;
+      align-items: center;
+      gap: 12px;
+      margin: 14px 0 18px;
+      font-family: "Trebuchet MS", sans-serif;
+    }
+
+    label { color: var(--ink); font-weight: 700; }
+
+    output {
+      color: var(--focus);
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+      text-align: right;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--focus);
+    }
+
+    .scale-switch {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      margin: 14px 0;
+      border: 1px solid var(--line);
+      background: var(--line);
+    }
+
+    .scale-switch button {
+      min-height: 54px;
+      padding: 8px 10px;
+      border: 0;
+      color: var(--ink);
+      background: rgb(255 255 255 / 88%);
+      font-family: "Trebuchet MS", sans-serif;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    .scale-switch button[aria-pressed="true"] {
+      color: white;
+      background: var(--focus);
+    }
+
+    .scale-switch small {
+      display: block;
+      margin-top: 2px;
+      font-size: 12px;
+    }
+
+    .note {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 680px) {
+      main { width: min(100% - 24px, 1200px); padding-top: 24px; }
+      header { display: block; }
+      header p { margin-top: 12px; }
+      h1 { font-size: 30px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .section-title { display: block; }
+      .caption { margin-top: 6px; }
+      .control { grid-template-columns: 84px 1fr 48px; }
+      .scale-switch button { font-size: 12px; }
+      canvas { height: 230px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>FMCW Transmit Viewer</h1>
+      <p>Interactive transmit-only view before IF mixing and Range FFT. The displays separate slow time, chirp timing, and the RF carrier so each scale remains readable.</p>
+    </header>
+
+    <div class="metrics" aria-label="Radar configuration">
+      <div class="metric"><span>Carrier</span><strong id="carrierMetric">60.000 GHz</strong></div>
+      <div class="metric"><span>Bandwidth</span><strong id="bandwidthMetric">768 MHz</strong></div>
+      <div class="metric"><span>Frame period</span><strong id="framePeriodMetric">80 ms</strong></div>
+      <div class="metric"><span>Capture</span><strong id="captureMetric">10.24 s</strong></div>
+    </div>
+
+    <section>
+      <div class="section-title">
+        <h2>FMCW frequency navigator</h2>
+        <span class="caption" id="navigatorCaption">128 frames, 7 up-chirps per frame</span>
+      </div>
+      <canvas id="overviewCanvas" aria-label="Slow-time overview; click to choose a time"></canvas>
+      <div class="scale-switch" role="group" aria-label="Time scale">
+        <button type="button" data-scale="capture" aria-pressed="true">Capture<small id="captureScaleValue">10.24 s</small></button>
+        <button type="button" data-scale="frame" aria-pressed="false">Frame<small id="frameScaleValue">80 ms</small></button>
+        <button type="button" data-scale="burst" aria-pressed="false">Burst<small id="burstScaleValue">96.88 us</small></button>
+        <button type="button" data-scale="chirp" aria-pressed="false">Chirp<small id="chirpScaleValue">13.84 us</small></button>
+      </div>
+      <canvas id="captureCanvas" aria-label="FMCW transmit frequency detail"></canvas>
+      <p class="note" id="frequencyNote">Each rising line is one FMCW up-chirp. Blank intervals are guard time or the idle portion of a frame.</p>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <h2>RF carrier detail</h2>
+        <span class="caption">First 0.2 ns of the selected chirp</span>
+      </div>
+      <div class="control">
+        <label for="chirpSlider">Chirp</label>
+        <input id="chirpSlider" type="range" min="1" max="7" value="1">
+        <output id="chirpOutput" for="chirpSlider">1 / 7</output>
+      </div>
+      <canvas id="rfCanvas" aria-label="FMCW RF carrier waveform"></canvas>
+      <p class="note">The RF carrier is shown locally because plotting its 60 GHz oscillation over 10.24 seconds would contain more than 600 billion cycles.</p>
+    </section>
+  </main>
+
+  <script>
+    let radar = {
+      carrierHz: 60e9,
+      slopeHzPerSecond: 75e12,
+      chirpDuration: 10.24e-6,
+      chirpPeriod: 13.84e-6,
+      chirpsPerFrame: 7,
+      framePeriod: 80e-3,
+      frameCount: 128,
+    };
+
+    const state = {
+      chirp: 1,
+      scale: 'capture',
+      focusTimeSeconds: 0,
+      captureWindowSeconds: radar.frameCount * radar.framePeriod,
+      captureStartSeconds: 0,
+    };
+    const colors = {
+      ink: '#102a43', muted: '#627d98', line: '#d9e2ec',
+      teal: '#007c7c', orange: '#d97706', guard: '#e8eef1',
+    };
+
+    function prepareCanvas(canvas) {
+      const box = canvas.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.round(box.width * ratio);
+      canvas.height = Math.round(box.height * ratio);
+      const context = canvas.getContext('2d');
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.lineJoin = 'round';
+      context.lineCap = 'round';
+      return { context, width: box.width, height: box.height };
+    }
+
+    function chartArea(width, height) {
+      return { left: 66, right: width - 24, top: 24, bottom: height - 42 };
+    }
+
+    function line(context, x1, y1, x2, y2, color, lineWidth = 1) {
+      context.beginPath();
+      context.moveTo(x1, y1);
+      context.lineTo(x2, y2);
+      context.strokeStyle = color;
+      context.lineWidth = lineWidth;
+      context.stroke();
+    }
+
+    function text(context, value, x, y, align = 'left', color = colors.muted) {
+      context.fillStyle = color;
+      context.textAlign = align;
+      context.font = '12px Trebuchet MS, sans-serif';
+      context.fillText(value, x, y);
+    }
+
+    function clamp(value, minimum, maximum) {
+      return Math.min(Math.max(value, minimum), maximum);
+    }
+
+    function formatDuration(seconds) {
+      if (seconds >= 1) return `${seconds.toFixed(2)} s`;
+      if (seconds >= 1e-3) return `${(seconds * 1e3).toFixed(2)} ms`;
+      return `${(seconds * 1e6).toFixed(2)} us`;
+    }
+
+    function alignWindowToNearestChirp(timeSeconds) {
+      const frameIndex = clamp(
+        Math.floor(timeSeconds / radar.framePeriod),
+        0,
+        radar.frameCount - 1,
+      );
+      const frameStart = frameIndex * radar.framePeriod;
+      const chirpIndex = clamp(
+        Math.round((timeSeconds - frameStart) / radar.chirpPeriod),
+        0,
+        radar.chirpsPerFrame - 1,
+      );
+      state.captureStartSeconds = frameStart + chirpIndex * radar.chirpPeriod;
+    }
+
+    function setScale(scale) {
+      const windows = {
+        capture: radar.frameCount * radar.framePeriod,
+        frame: radar.framePeriod,
+        burst: radar.chirpsPerFrame * radar.chirpPeriod,
+        chirp: radar.chirpPeriod,
+      };
+      state.scale = scale;
+      state.captureWindowSeconds = windows[scale];
+
+      if (scale === 'capture') {
+        state.captureStartSeconds = 0;
+      } else if (scale === 'chirp') {
+        alignWindowToNearestChirp(state.focusTimeSeconds);
+      } else {
+        const frameIndex = clamp(
+          Math.floor(state.focusTimeSeconds / radar.framePeriod),
+          0,
+          radar.frameCount - 1,
+        );
+        state.captureStartSeconds = frameIndex * radar.framePeriod;
+      }
+    }
+
+    function captureTickStep(seconds) {
+      if (seconds >= 8) return 2;
+      if (seconds >= 2) return 0.5;
+      if (seconds >= 0.2) return 0.05;
+      if (seconds >= 0.02) return 0.005;
+      return 0.001;
+    }
+
+    function drawOverview() {
+      const canvas = document.querySelector('#overviewCanvas');
+      const { context, width, height } = prepareCanvas(canvas);
+      const area = chartArea(width, height);
+      const totalSeconds = radar.frameCount * radar.framePeriod;
+      const xFor = seconds => area.left + seconds / totalSeconds * (area.right - area.left);
+
+      line(context, area.left, area.bottom, area.right, area.bottom, colors.ink);
+      for (let second = 0; second <= 10; second += 2) {
+        const x = xFor(second);
+        line(context, x, area.top, x, area.bottom, colors.line);
+        text(context, `${second} s`, x, area.bottom + 22, 'center');
+      }
+      for (let frame = 0; frame < radar.frameCount; frame += 1) {
+        const x = xFor(frame * radar.framePeriod);
+        line(context, x, area.bottom, x, area.top + 12, colors.teal, 1);
+      }
+      const focusX = xFor(state.focusTimeSeconds);
+      line(context, focusX, area.bottom, focusX, area.top, colors.orange, 3);
+      text(context, 'Slow time (s)', (area.left + area.right) / 2, height - 8, 'center', colors.ink);
+    }
+
+    function drawCapture() {
+      const canvas = document.querySelector('#captureCanvas');
+      const { context, width, height } = prepareCanvas(canvas);
+      const area = chartArea(width, height);
+      const totalSeconds = radar.frameCount * radar.framePeriod;
+      const viewStart = state.captureStartSeconds;
+      const viewEnd = viewStart + state.captureWindowSeconds;
+      const xFor = seconds => area.left + (seconds - viewStart) / state.captureWindowSeconds * (area.right - area.left);
+      const minimumFrequency = radar.carrierHz;
+      const maximumFrequency = radar.carrierHz + radar.slopeHzPerSecond * radar.chirpDuration;
+      const yFor = frequency => area.bottom - (frequency - minimumFrequency) / (maximumFrequency - minimumFrequency) * (area.bottom - area.top);
+
+      line(context, area.left, area.bottom, area.right, area.bottom, colors.ink);
+      line(context, area.left, area.top, area.left, area.bottom, colors.ink);
+      for (let frequency = 60.0; frequency <= 60.8; frequency += 0.2) {
+        const y = yFor(frequency * 1e9);
+        line(context, area.left, y, area.right, y, colors.line);
+        text(context, `${frequency.toFixed(1)} GHz`, area.left - 10, y + 4, 'right');
+      }
+      if (state.captureWindowSeconds < 1e-3) {
+        for (let tick = 0; tick <= 4; tick += 1) {
+          const relativeTime = tick / 4 * state.captureWindowSeconds;
+          const x = xFor(viewStart + relativeTime);
+          line(context, x, area.top, x, area.bottom, colors.line);
+          text(context, formatDuration(relativeTime), x, area.bottom + 22, 'center');
+        }
+      } else {
+        const tickStep = captureTickStep(state.captureWindowSeconds);
+        const firstTick = Math.ceil(viewStart / tickStep) * tickStep;
+        for (let second = firstTick; second <= viewEnd + tickStep * 0.1; second += tickStep) {
+          const x = xFor(second);
+          line(context, x, area.top, x, area.bottom, colors.line);
+          text(context, formatDuration(second), x, area.bottom + 22, 'center');
+        }
+      }
+      for (let index = 0; index < radar.frameCount; index += 1) {
+        const frameStart = index * radar.framePeriod;
+        if (frameStart > viewEnd || frameStart + radar.framePeriod < viewStart) continue;
+        for (let chirp = 0; chirp < radar.chirpsPerFrame; chirp += 1) {
+          const chirpStart = frameStart + chirp * radar.chirpPeriod;
+          const chirpEnd = chirpStart + radar.chirpDuration;
+          if (chirpEnd < viewStart || chirpStart > viewEnd) continue;
+          const visibleStart = Math.max(chirpStart, viewStart);
+          const visibleEnd = Math.min(chirpEnd, viewEnd);
+          const startFrequency = minimumFrequency + radar.slopeHzPerSecond * (visibleStart - chirpStart);
+          const endFrequency = minimumFrequency + radar.slopeHzPerSecond * (visibleEnd - chirpStart);
+          context.beginPath();
+          context.moveTo(xFor(visibleStart), yFor(startFrequency));
+          context.lineTo(xFor(visibleEnd), yFor(endFrequency));
+          context.strokeStyle = colors.teal;
+          context.lineWidth = 2;
+          context.stroke();
+
+          if (state.scale === 'burst' || state.scale === 'chirp') {
+            const connectionStart = chirpEnd;
+            const connectionEnd = chirpStart + radar.chirpPeriod;
+            const visibleConnectionStart = Math.max(connectionStart, viewStart);
+            const visibleConnectionEnd = Math.min(connectionEnd, viewEnd);
+
+            if (visibleConnectionStart < visibleConnectionEnd) {
+              const connectionDuration = connectionEnd - connectionStart;
+              const connectionStartFrequency = maximumFrequency -
+                (visibleConnectionStart - connectionStart) /
+                connectionDuration * (maximumFrequency - minimumFrequency);
+              const connectionEndFrequency = maximumFrequency -
+                (visibleConnectionEnd - connectionStart) /
+                connectionDuration * (maximumFrequency - minimumFrequency);
+
+              context.beginPath();
+              context.setLineDash([6, 5]);
+              context.moveTo(
+                xFor(visibleConnectionStart),
+                yFor(connectionStartFrequency),
+              );
+              context.lineTo(
+                xFor(visibleConnectionEnd),
+                yFor(connectionEndFrequency),
+              );
+              context.strokeStyle = colors.muted;
+              context.lineWidth = 1.5;
+              context.stroke();
+              context.setLineDash([]);
+            }
+          }
+        }
+      }
+      const viewLabel = state.captureWindowSeconds < 1e-3
+        ? `Slow-time start: ${viewStart.toFixed(9)} s; window: ${formatDuration(state.captureWindowSeconds)}`
+        : `Slow time view: ${formatDuration(viewStart)} to ${formatDuration(viewEnd)}`;
+      text(context, viewLabel, (area.left + area.right) / 2, height - 8, 'center', colors.ink);
+    }
+
+    function drawRf() {
+      const canvas = document.querySelector('#rfCanvas');
+      const { context, width, height } = prepareCanvas(canvas);
+      const area = chartArea(width, height);
+      const duration = 0.2e-9;
+      const chirpStart = (state.chirp - 1) * radar.chirpPeriod;
+      const xFor = seconds => area.left + seconds / duration * (area.right - area.left);
+      const yFor = amplitude => (area.top + area.bottom) / 2 - amplitude * (area.bottom - area.top) * 0.44;
+
+      line(context, area.left, yFor(0), area.right, yFor(0), colors.line);
+      line(context, area.left, area.top, area.left, area.bottom, colors.ink);
+      for (let nanoseconds = 0; nanoseconds <= 0.2; nanoseconds += 0.05) {
+        const x = xFor(nanoseconds * 1e-9);
+        line(context, x, area.top, x, area.bottom, colors.line);
+        text(context, `${nanoseconds.toFixed(2)} ns`, x, area.bottom + 22, 'center');
+      }
+      text(context, '+1', area.left - 10, yFor(1) + 4, 'right');
+      text(context, '0', area.left - 10, yFor(0) + 4, 'right');
+      text(context, '-1', area.left - 10, yFor(-1) + 4, 'right');
+
+      context.beginPath();
+      const samples = 1400;
+      for (let sample = 0; sample < samples; sample += 1) {
+        const time = sample / (samples - 1) * duration;
+        const absoluteTime = chirpStart + time;
+        const phase = 2 * Math.PI * (radar.carrierHz * absoluteTime + 0.5 * radar.slopeHzPerSecond * absoluteTime * absoluteTime);
+        const x = xFor(time);
+        const y = yFor(Math.cos(phase));
+        if (sample === 0) context.moveTo(x, y); else context.lineTo(x, y);
+      }
+      context.strokeStyle = colors.orange;
+      context.lineWidth = 2;
+      context.stroke();
+      text(context, `Chirp ${state.chirp}: real-valued Tx RF carrier`, (area.left + area.right) / 2, height - 8, 'center', colors.ink);
+    }
+
+    function render() {
+      document.querySelector('#chirpOutput').value = `${state.chirp} / ${radar.chirpsPerFrame}`;
+      document.querySelector('#chirpSlider').max = String(radar.chirpsPerFrame);
+      document.querySelector('#carrierMetric').textContent = `${(radar.carrierHz / 1e9).toFixed(3)} GHz`;
+      document.querySelector('#bandwidthMetric').textContent = `${(radar.slopeHzPerSecond * radar.chirpDuration / 1e6).toFixed(0)} MHz`;
+      document.querySelector('#framePeriodMetric').textContent = formatDuration(radar.framePeriod);
+      document.querySelector('#captureMetric').textContent = formatDuration(radar.frameCount * radar.framePeriod);
+      document.querySelector('#navigatorCaption').textContent =
+        `${radar.frameCount} frames, ${radar.chirpsPerFrame} up-chirps per frame`;
+      document.querySelector('#captureScaleValue').textContent =
+        formatDuration(radar.frameCount * radar.framePeriod);
+      document.querySelector('#frameScaleValue').textContent = formatDuration(radar.framePeriod);
+      document.querySelector('#burstScaleValue').textContent =
+        formatDuration(radar.chirpsPerFrame * radar.chirpPeriod);
+      document.querySelector('#chirpScaleValue').textContent = formatDuration(radar.chirpPeriod);
+      for (const button of document.querySelectorAll('[data-scale]')) {
+        button.setAttribute('aria-pressed', String(button.dataset.scale === state.scale));
+      }
+      document.querySelector('#frequencyNote').textContent =
+        `View: ${state.scale}. Window: ${formatDuration(state.captureWindowSeconds)}. ` +
+        'Each rising line is one FMCW up-chirp; blank intervals have no transmitted sweep.';
+      drawOverview();
+      drawCapture();
+      drawRf();
+    }
+
+    for (const button of document.querySelectorAll('[data-scale]')) {
+      button.addEventListener('click', () => {
+        setScale(button.dataset.scale);
+        render();
+      });
+    }
+    document.querySelector('#chirpSlider').addEventListener('input', event => {
+      state.chirp = Number(event.target.value);
+      render();
+    });
+    document.querySelector('#overviewCanvas').addEventListener('click', event => {
+      const canvas = event.currentTarget;
+      const box = canvas.getBoundingClientRect();
+      const pointerFraction = clamp((event.clientX - box.left) / box.width, 0, 1);
+      const totalSeconds = radar.frameCount * radar.framePeriod;
+      state.focusTimeSeconds = pointerFraction * totalSeconds;
+      setScale(state.scale);
+      render();
+    });
+    window.addEventListener('resize', render);
+
+    async function loadRadarConfig() {
+      try {
+        const response = await fetch('output/fmcw_waveform_config.json', {
+          cache: 'no-store',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        radar = { ...radar, ...await response.json() };
+      } catch (error) {
+        console.warn('Using built-in FMCW viewer defaults.', error);
+      }
+      setScale(state.scale);
+      render();
+    }
+
+    loadRadarConfig();
+  </script>
+</body>
+</html>

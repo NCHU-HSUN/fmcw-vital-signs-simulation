@@ -3,12 +3,12 @@ from __future__ import annotations
 # pyright: reportUnknownMemberType=false
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
-from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from scipy.signal import butter, filtfilt
 
@@ -23,7 +23,7 @@ class RadarConfig:
 
     # -------------------------- 雷達發射參數 -------------------------- #
     c: float = 3.0e8
-    fc: float = 60.0e9
+    fc: float = 77.0e9
     chirp_slope: float = 75.0e12
 
     # --------------------------- Fast Time --------------------------- #
@@ -115,6 +115,30 @@ class PlotConfig:
     save_displacement: bool = True
     save_filtered_signals: bool = True
     save_spectrum: bool = True
+
+
+def save_waveform_viewer_config(
+    config: RadarConfig,
+    plot_config: PlotConfig,
+) -> None:
+    """輸出網頁 FMCW 波形檢視器所需的雷達設定。"""
+
+    viewer_config: dict[str, float | int] = {
+        "carrierHz": config.fc,
+        "slopeHzPerSecond": config.chirp_slope,
+        "chirpDuration": config.chirp_duration,
+        "chirpPeriod": config.chirp_period,
+        "chirpsPerFrame": config.chirps_per_loop * config.num_loops,
+        "framePeriod": config.frame_periodicity,
+        "frameCount": config.frame_length,
+    }
+    file_path: Path = plot_config.output_dir / "fmcw_waveform_config.json"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(
+        json.dumps(viewer_config, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[已儲存網頁設定] {file_path}")
 
 
 def plot_transmitted_fmcw_waveform(
@@ -238,7 +262,8 @@ def plot_transmitted_fmcw_waveform(
 
     fig.suptitle(
         "FMCW Transmit Signal Before IF Mixing and Range FFT "
-        f"({config.frame_length} Frames, {capture_duration_s:.2f} s Capture)",
+        f"({config.frame_length} Frames, {capture_duration_s:.2f} s Capture, "
+        f"{active_frame_duration_s * 1.0e6:.2f} µs Active per Frame)",
         fontsize=15,
         fontweight="bold",
     )
@@ -1174,6 +1199,11 @@ def main() -> None:
         show_figures=False,
         save_fmcw_waveform=True,
         save_vital_sign_summary=True,
+    )
+
+    save_waveform_viewer_config(
+        config=radar_config,
+        plot_config=plot_config,
     )
 
     # 圖 1：FMCW 發射 RF 波形（尚未產生 IF 或執行 Range FFT）
