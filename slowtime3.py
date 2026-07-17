@@ -17,6 +17,7 @@ FloatArray = npt.NDArray[np.float64]
 ComplexArray = npt.NDArray[np.complex128]
 
 
+# ------------------------------- Data models ------------------------------ #
 @dataclass(frozen=True)
 class RadarConfig:
     """FMCW Radar 與生命徵象模擬參數。"""
@@ -55,6 +56,12 @@ class RadarConfig:
     add_noise: bool = False
     random_seed: int = 42
 
+    breath_cut_search_low_bpm: float = 5.0
+    breath_cut_search_high_bpm: float = 120.0
+    heart_cut_search_low_bpm: float = 60.0
+    heart_cut_search_high_bpm: float = 200.0
+
+
     @property
     def wavelength_m(self) -> float:
         return self.c / self.fc
@@ -74,31 +81,31 @@ class RadarConfig:
     @property
     def bandwidth_hz(self) -> float:
         return self.chirp_slope * self.chirp_duration
+
     @property
     def heart_frequency_hz(self) -> float:
         return self.heart_frequency_bpm / 60.0
+
     @property
     def breath_frequency_hz(self) -> float:
         return self.breath_frequency_bpm / 60.0
+    @property
+    def breath_cut_search_low_hz(self) -> float:
+        return self.breath_cut_search_low_bpm / 60.0
+    @property
+    def breath_cut_search_high_hz(self) -> float:
+        return self.breath_cut_search_high_bpm / 60.0
+    @property
+    def heart_cut_search_low_hz(self) -> float:
+        return self.heart_cut_search_low_bpm / 60.0
+    @property
+    def heart_cut_search_high_hz(self) -> float:
+        return self.heart_cut_search_high_bpm / 60.0
 
 
 @dataclass(frozen=True)
 class PlotConfig:
-    """
-    控制圖片是否儲存與是否顯示。
-
-    save_range_profile:
-        Range FFT 結果，通常用於確認目標所在 Range Bin。
-
-    save_displacement:
-        原始理論位移與雷達估計位移，建議保留。
-
-    save_filtered_signals:
-        呼吸與心跳帶通濾波結果，建議保留。
-
-    save_spectrum:
-        呼吸與心跳頻譜、峰值與估測頻率，建議保留。
-    """
+    """控制圖片是否儲存與是否顯示。"""
 
     output_dir: Path = Path("output")
     show_figures: bool = True
@@ -109,172 +116,6 @@ class PlotConfig:
 
     # Range Profile、位移、濾波結果、頻譜合併圖
     save_vital_sign_summary: bool = True
-
-    # 個別生命徵象圖
-    save_range_profile: bool = True
-    save_displacement: bool = True
-    save_filtered_signals: bool = True
-    save_spectrum: bool = True
-
-
-def save_waveform_viewer_config(
-    config: RadarConfig,
-    plot_config: PlotConfig,
-) -> None:
-    """輸出網頁 FMCW 波形檢視器所需的雷達設定。"""
-
-    viewer_config: dict[str, float | int] = {
-        "carrierHz": config.fc,
-        "slopeHzPerSecond": config.chirp_slope,
-        "chirpDuration": config.chirp_duration,
-        "chirpPeriod": config.chirp_period,
-        "chirpsPerFrame": config.chirps_per_loop * config.num_loops,
-        "framePeriod": config.frame_periodicity,
-        "frameCount": config.frame_length,
-    }
-    file_path: Path = plot_config.output_dir / "fmcw_waveform_config.json"
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(
-        json.dumps(viewer_config, indent=2),
-        encoding="utf-8",
-    )
-    print(f"[已儲存網頁設定] {file_path}")
-
-
-def plot_transmitted_fmcw_waveform(
-    config: RadarConfig,
-    plot_config: PlotConfig,
-) -> None:
-    """繪製一個 frame 中尚未混頻的 FMCW 發射 RF 波形。"""
-
-    chirps_per_frame: int = config.chirps_per_loop * config.num_loops
-    active_frame_duration_s: float = (
-        chirps_per_frame * config.chirp_period
-    )
-    capture_duration_s: float = config.frame_length * config.frame_periodicity
-    frame_start_times_s: FloatArray = (
-        np.arange(config.frame_length, dtype=np.float64)
-        * config.frame_periodicity
-    )
-
-    transmit_gate_time_s: list[float] = []
-    transmit_gate_amplitude: list[float] = []
-
-    for frame_start_s in frame_start_times_s:
-        for chirp_index in range(chirps_per_frame):
-            chirp_start_s: float = (
-                frame_start_s + chirp_index * config.chirp_period
-            )
-            chirp_end_s: float = chirp_start_s + config.chirp_duration
-            transmit_gate_time_s.extend(
-                [chirp_start_s, chirp_start_s, chirp_end_s, chirp_end_s]
-            )
-            transmit_gate_amplitude.extend([0.0, 1.0, 1.0, 0.0])
-
-    transmit_gate_time: FloatArray = np.array(
-        transmit_gate_time_s,
-        dtype=np.float64,
-    )
-    transmit_gate: FloatArray = np.array(
-        transmit_gate_amplitude,
-        dtype=np.float64,
-    )
-
-    # 60 GHz RF 訊號週期極短，因此只放大顯示 chirp 起始的 0.2 ns。
-    waveform_duration_s: float = 0.2e-9
-    waveform_time: FloatArray = np.linspace(
-        0.0,
-        waveform_duration_s,
-        num=2_000,
-        dtype=np.float64,
-    )
-    transmitted_signal: FloatArray = np.cos(
-        2.0
-        * np.pi
-        * (
-            config.fc * waveform_time
-            + 0.5 * config.chirp_slope * waveform_time**2
-        )
-    )
-
-    fig, axes = plt.subplots(
-        nrows=3,
-        ncols=1,
-        figsize=(12, 11),
-    )
-
-    axes[0].plot(
-        transmit_gate_time,
-        transmit_gate,
-        color="#007C7C",
-        linewidth=1.5,
-    )
-    axes[0].set_title("Transmit Gate Across the Complete Slow-Time Capture")
-    axes[0].set_xlabel("Slow time (s)")
-    axes[0].set_ylabel("Transmit enabled")
-    axes[0].set_ylim(-0.15, 1.15)
-    axes[0].set_yticks([0.0, 1.0])
-    axes[0].grid(True, linestyle="--", alpha=0.5)
-
-    for chirp_index in range(chirps_per_frame):
-        chirp_start_s: float = chirp_index * config.chirp_period
-        chirp_end_s: float = chirp_start_s + config.chirp_duration
-        chirp_frequency_ghz: FloatArray = np.array(
-            [config.fc, config.fc + config.bandwidth_hz],
-            dtype=np.float64,
-        ) / 1.0e9
-
-        axes[1].plot(
-            np.array([chirp_start_s, chirp_end_s]) * 1.0e6,
-            chirp_frequency_ghz,
-            color="#007C7C",
-            linewidth=1.8,
-        )
-        axes[1].plot(
-            np.full(2, chirp_end_s * 1.0e6),
-            chirp_frequency_ghz[::-1],
-            color="#007C7C",
-            linewidth=1.2,
-        )
-        axes[1].axvspan(
-            chirp_end_s * 1.0e6,
-            (chirp_start_s + config.chirp_period) * 1.0e6,
-            color="lightgray",
-            alpha=0.35,
-        )
-
-    axes[1].set_title("FMCW Transmit Frequency Across All Chirps in Frame 1")
-    axes[1].set_xlabel("Time within active frame burst (µs)")
-    axes[1].set_ylabel("Transmit frequency (GHz)")
-    axes[1].grid(True, linestyle="--", alpha=0.5)
-
-    axes[2].plot(
-        waveform_time * 1.0e9,
-        transmitted_signal,
-        color="#D99000",
-        linewidth=1.2,
-    )
-    axes[2].set_title("FMCW Transmit RF Waveform (First 0.2 ns of Chirp 1)")
-    axes[2].set_xlabel("Time within chirp (ns)")
-    axes[2].set_ylabel("Normalized amplitude")
-    axes[2].set_ylim(-1.1, 1.1)
-    axes[2].grid(True, linestyle="--", alpha=0.5)
-
-    fig.suptitle(
-        "FMCW Transmit Signal Before IF Mixing and Range FFT "
-        f"({config.frame_length} Frames, {capture_duration_s:.2f} s Capture, "
-        f"{active_frame_duration_s * 1.0e6:.2f} µs Active per Frame)",
-        fontsize=15,
-        fontweight="bold",
-    )
-
-    save_or_show_figure(
-        figure=fig,
-        file_path=plot_config.output_dir / "01_fmcw_transmit_waveform.png",
-        should_save=plot_config.save_fmcw_waveform,
-        should_show=plot_config.show_figures,
-        dpi=plot_config.dpi,
-    )
 
 
 @dataclass(frozen=True)
@@ -300,6 +141,31 @@ class VitalSignResult:
 
     estimated_breath_frequency_hz: float
     estimated_heart_frequency_hz: float
+
+
+# ----------------------------- Output helpers ----------------------------- #
+def save_waveform_viewer_config(
+    config: RadarConfig,
+    plot_config: PlotConfig,
+) -> None:
+    """輸出網頁 FMCW 波形檢視器所需的雷達設定。"""
+
+    viewer_config: dict[str, float | int] = {
+        "carrierHz": config.fc,
+        "slopeHzPerSecond": config.chirp_slope,
+        "chirpDuration": config.chirp_duration,
+        "chirpPeriod": config.chirp_period,
+        "chirpsPerFrame": config.chirps_per_loop * config.num_loops,
+        "framePeriod": config.frame_periodicity,
+        "frameCount": config.frame_length,
+    }
+    file_path: Path = plot_config.output_dir / "fmcw_waveform_config.json"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(
+        json.dumps(viewer_config, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[已儲存網頁設定] {file_path}")
 
 
 def save_or_show_figure(
@@ -328,6 +194,7 @@ def save_or_show_figure(
     plt.close(figure)
 
 
+# --------------------------- Signal processing ---------------------------- #
 def bandpass_filter(
     signal: FloatArray,
     sampling_rate_hz: float,
@@ -406,6 +273,7 @@ def estimate_peak_frequency(
     return estimated_frequency_hz, frequency_axis, spectrum
 
 
+# -------------------------- Simulation and analysis ----------------------- #
 def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     """模擬 FMCW 雷達生命徵象訊號，並進行 Range FFT、相位解調與頻率估測。"""
 
@@ -602,6 +470,143 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         estimated_breath_frequency_hz=estimated_breath_frequency_hz,
         estimated_heart_frequency_hz=estimated_heart_frequency_hz,
     )
+
+# --------------------------------- Plotting -------------------------------- #
+def plot_transmitted_fmcw_waveform(
+    config: RadarConfig,
+    plot_config: PlotConfig,
+) -> None:
+    """繪製一個 frame 中尚未混頻的 FMCW 發射 RF 波形。"""
+
+    chirps_per_frame: int = config.chirps_per_loop * config.num_loops
+    active_frame_duration_s: float = (
+        chirps_per_frame * config.chirp_period
+    )
+    capture_duration_s: float = config.frame_length * config.frame_periodicity
+    frame_start_times_s: FloatArray = (
+        np.arange(config.frame_length, dtype=np.float64)
+        * config.frame_periodicity
+    )
+
+    transmit_gate_time_s: list[float] = []
+    transmit_gate_amplitude: list[float] = []
+
+    for frame_start_s in frame_start_times_s:
+        for chirp_index in range(chirps_per_frame):
+            chirp_start_s: float = (
+                frame_start_s + chirp_index * config.chirp_period
+            )
+            chirp_end_s: float = chirp_start_s + config.chirp_duration
+            transmit_gate_time_s.extend(
+                [chirp_start_s, chirp_start_s, chirp_end_s, chirp_end_s]
+            )
+            transmit_gate_amplitude.extend([0.0, 1.0, 1.0, 0.0])
+
+    transmit_gate_time: FloatArray = np.array(
+        transmit_gate_time_s,
+        dtype=np.float64,
+    )
+    transmit_gate: FloatArray = np.array(
+        transmit_gate_amplitude,
+        dtype=np.float64,
+    )
+
+    # 60 GHz RF 訊號週期極短，因此只放大顯示 chirp 起始的 0.2 ns。
+    waveform_duration_s: float = 0.2e-9
+    waveform_time: FloatArray = np.linspace(
+        0.0,
+        waveform_duration_s,
+        num=2_000,
+        dtype=np.float64,
+    )
+    transmitted_signal: FloatArray = np.cos(
+        2.0
+        * np.pi
+        * (
+            config.fc * waveform_time
+            + 0.5 * config.chirp_slope * waveform_time**2
+        )
+    )
+
+    fig, axes = plt.subplots(
+        nrows=3,
+        ncols=1,
+        figsize=(12, 11),
+    )
+
+    axes[0].plot(
+        transmit_gate_time,
+        transmit_gate,
+        color="#007C7C",
+        linewidth=1.5,
+    )
+    axes[0].set_title("Transmit Gate Across the Complete Slow-Time Capture")
+    axes[0].set_xlabel("Slow time (s)")
+    axes[0].set_ylabel("Transmit enabled")
+    axes[0].set_ylim(-0.15, 1.15)
+    axes[0].set_yticks([0.0, 1.0])
+    axes[0].grid(True, linestyle="--", alpha=0.5)
+
+    for chirp_index in range(chirps_per_frame):
+        chirp_start_s: float = chirp_index * config.chirp_period
+        chirp_end_s: float = chirp_start_s + config.chirp_duration
+        chirp_frequency_ghz: FloatArray = np.array(
+            [config.fc, config.fc + config.bandwidth_hz],
+            dtype=np.float64,
+        ) / 1.0e9
+
+        axes[1].plot(
+            np.array([chirp_start_s, chirp_end_s]) * 1.0e6,
+            chirp_frequency_ghz,
+            color="#007C7C",
+            linewidth=1.8,
+        )
+        axes[1].plot(
+            np.full(2, chirp_end_s * 1.0e6),
+            chirp_frequency_ghz[::-1],
+            color="#007C7C",
+            linewidth=1.2,
+        )
+        axes[1].axvspan(
+            chirp_end_s * 1.0e6,
+            (chirp_start_s + config.chirp_period) * 1.0e6,
+            color="lightgray",
+            alpha=0.35,
+        )
+
+    axes[1].set_title("FMCW Transmit Frequency Across All Chirps in Frame 1")
+    axes[1].set_xlabel("Time within active frame burst (µs)")
+    axes[1].set_ylabel("Transmit frequency (GHz)")
+    axes[1].grid(True, linestyle="--", alpha=0.5)
+
+    axes[2].plot(
+        waveform_time * 1.0e9,
+        transmitted_signal,
+        color="#D99000",
+        linewidth=1.2,
+    )
+    axes[2].set_title("FMCW Transmit RF Waveform (First 0.2 ns of Chirp 1)")
+    axes[2].set_xlabel("Time within chirp (ns)")
+    axes[2].set_ylabel("Normalized amplitude")
+    axes[2].set_ylim(-1.1, 1.1)
+    axes[2].grid(True, linestyle="--", alpha=0.5)
+
+    fig.suptitle(
+        "FMCW Transmit Signal Before IF Mixing and Range FFT "
+        f"({config.frame_length} Frames, {capture_duration_s:.2f} s Capture, "
+        f"{active_frame_duration_s * 1.0e6:.2f} µs Active per Frame)",
+        fontsize=15,
+        fontweight="bold",
+    )
+
+    save_or_show_figure(
+        figure=fig,
+        file_path=plot_config.output_dir / "01_fmcw_transmit_waveform.png",
+        should_save=plot_config.save_fmcw_waveform,
+        should_show=plot_config.show_figures,
+        dpi=plot_config.dpi,
+    )
+
 
 def plot_vital_sign_summary(
     config: RadarConfig,
@@ -869,278 +874,6 @@ def plot_vital_sign_summary(
         dpi=plot_config.dpi,
     )
 
-def plot_fmcw_waveform(
-    config: RadarConfig,
-    plot_config: PlotConfig,
-) -> None:
-    """
-    繪製 FMCW Chirp 時頻圖。
-
-    上半部：
-        顯示 2 個 Frame 的壓縮時間軸。
-
-    下半部：
-        放大顯示 Frame 1 的 Chirp。
-        每個 Chirp 從 0 MHz 線性掃頻至 Bandwidth。
-        Chirp 結束後為 Guard Time。
-    """
-
-    # 上半部：只顯示兩個 Frame
-    frames_to_show: int = 2
-
-    # 下半部：顯示 Frame 1 的所有 Chirp
-    chirps_to_show: int = (
-        config.chirps_per_loop * config.num_loops
-    )
-
-    bandwidth_hz: float = config.bandwidth_hz
-    bandwidth_mhz: float = bandwidth_hz / 1.0e6
-
-    chirp_duration_us: float = config.chirp_duration * 1.0e6
-    chirp_period_us: float = config.chirp_period * 1.0e6
-    guard_time_us: float = chirp_period_us - chirp_duration_us
-
-    frame_period_us: float = config.frame_periodicity * 1.0e6
-
-    frame_colors: tuple[str, str] = (
-        "#007C7C",  # Frame 1: Teal
-        "#D99000",  # Frame 2: Orange
-    )
-
-    fig, axes = plt.subplots(
-        nrows=2,
-        ncols=1,
-        figsize=(14, 11),
-        gridspec_kw={
-            "height_ratios": [1.0, 1.35],
-        },
-    )
-
-    # ====================================================================== #
-    # 上半部：2 個 Frame 壓縮時間軸
-    # ====================================================================== #
-    top_ax = axes[0]
-
-    for frame_index in range(frames_to_show):
-        frame_number: int = frame_index + 1
-        frame_start_us: float = frame_index * frame_period_us
-        color: str = frame_colors[frame_index]
-
-        # 壓縮時間軸中，每個 Frame 使用一條垂直線表示 FMCW 掃頻
-        top_ax.plot(
-            [frame_start_us, frame_start_us],
-            [0.0, bandwidth_mhz],
-            color=color,
-            linewidth=2.2,
-            label=f"Frame {frame_number}",
-        )
-
-        # Frame 名稱標記
-        label_x_us: float = frame_start_us + frame_period_us * 0.50
-
-        top_ax.text(
-            label_x_us,
-            bandwidth_mhz * 1.05,
-            f"F{frame_number}",
-            color=color,
-            fontsize=11,
-            fontweight="bold",
-            ha="center",
-            va="bottom",
-        )
-
-    top_ax.set_title(
-        "FMCW Frame Timeline (Compressed View)",
-        fontsize=13,
-        fontweight="bold",
-    )
-
-    top_ax.set_xlabel(
-        "Time (µs, compressed — "
-        f"1 frame = {config.frame_periodicity * 1.0e3:.0f} ms)"
-    )
-
-    top_ax.set_ylabel("Relative Frequency (MHz from $f_c$)")
-
-    # 顯示 F1 與 F2，x 軸延伸到第二個 Frame 結束
-    top_ax.set_xlim(
-        0.0,
-        frames_to_show * frame_period_us,
-    )
-
-    top_ax.set_ylim(
-        -bandwidth_mhz * 0.05,
-        bandwidth_mhz * 1.15,
-    )
-
-    top_ax.grid(True, linestyle="--", alpha=0.5)
-
-    top_ax.legend(
-        loc="upper left",
-        ncol=2,
-        bbox_to_anchor=(0.0, 1.18),
-        frameon=False,
-    )
-
-    # ====================================================================== #
-    # 下半部：Frame 1 的全部 Chirp
-    # ====================================================================== #
-    bottom_ax = axes[1]
-
-    for chirp_index in range(chirps_to_show):
-        chirp_number: int = chirp_index + 1
-
-        chirp_start_us: float = chirp_index * chirp_period_us
-        chirp_end_us: float = chirp_start_us + chirp_duration_us
-        chirp_period_end_us: float = chirp_start_us + chirp_period_us
-
-        # FMCW Up-Chirp: 0 MHz -> Bandwidth MHz
-        chirp_time_us: FloatArray = np.array(
-            [chirp_start_us, chirp_end_us],
-            dtype=np.float64,
-        )
-
-        chirp_frequency_mhz: FloatArray = np.array(
-            [0.0, bandwidth_mhz],
-            dtype=np.float64,
-        )
-
-        bottom_ax.plot(
-            chirp_time_us,
-            chirp_frequency_mhz,
-            color="#007C7C",
-            linewidth=2.0,
-        )
-
-        # Chirp 結束後頻率歸零
-        bottom_ax.plot(
-            [chirp_end_us, chirp_end_us],
-            [bandwidth_mhz, 0.0],
-            color="#007C7C",
-            linewidth=2.0,
-        )
-
-        # Guard Time 平坦區域
-        bottom_ax.plot(
-            [chirp_end_us, chirp_period_end_us],
-            [0.0, 0.0],
-            color="#007C7C",
-            linewidth=2.0,
-        )
-
-        # Guard Time 灰色背景
-        bottom_ax.axvspan(
-            chirp_end_us,
-            chirp_period_end_us,
-            color="lightgray",
-            alpha=0.35,
-        )
-
-        # Guard 標示
-        guard_center_us: float = (
-            chirp_end_us + chirp_period_end_us
-        ) / 2.0
-
-        bottom_ax.text(
-            guard_center_us,
-            bandwidth_mhz * 0.56,
-            "Guard",
-            color="gray",
-            fontsize=8,
-            ha="center",
-            va="center",
-        )
-
-        # Chirp 編號
-        chirp_center_us: float = (
-            chirp_start_us + chirp_end_us
-        ) / 2.0
-
-        bottom_ax.text(
-            chirp_center_us,
-            bandwidth_mhz * 1.04,
-            f"Chirp {chirp_number}",
-            color="#007C7C",
-            fontsize=8,
-            fontweight="bold",
-            ha="center",
-            va="bottom",
-        )
-
-    # 僅在第一個 Chirp 標記 Tc / Ts / Guard Time
-    first_chirp_center_us: float = chirp_duration_us / 2.0
-
-    bottom_ax.text(
-        first_chirp_center_us,
-        -bandwidth_mhz * 0.13,
-        f"Tc = {chirp_duration_us:.2f} µs",
-        color="#007C7C",
-        fontsize=9,
-        ha="center",
-        va="top",
-    )
-
-    bottom_ax.text(
-        chirp_period_us / 2.0,
-        -bandwidth_mhz * 0.25,
-        f"Ts = {chirp_period_us:.2f} µs",
-        color="#D99000",
-        fontsize=9,
-        ha="center",
-        va="top",
-    )
-
-    bottom_ax.text(
-        chirp_duration_us + guard_time_us / 2.0,
-        -bandwidth_mhz * 0.13,
-        f"Guard = {guard_time_us:.2f} µs",
-        color="gray",
-        fontsize=9,
-        ha="center",
-        va="top",
-    )
-
-    total_detail_time_us: float = chirps_to_show * chirp_period_us
-
-    bottom_ax.set_title(
-        f"Frame 1 Detail ({chirps_to_show} Chirps)",
-        fontsize=13,
-        fontweight="bold",
-    )
-
-    bottom_ax.set_xlabel("Time (µs)")
-    bottom_ax.set_ylabel("Relative Frequency (MHz from $f_c$)")
-
-    bottom_ax.set_xlim(
-        0.0,
-        total_detail_time_us,
-    )
-
-    bottom_ax.set_ylim(
-        -bandwidth_mhz * 0.32,
-        bandwidth_mhz * 1.12,
-    )
-
-    bottom_ax.grid(True, linestyle="--", alpha=0.5)
-
-    fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
-        "FMCW Chirp Structure",
-        fontsize=16,
-        fontweight="bold",
-    )
-
-    fig.subplots_adjust(
-        top=0.90,
-        hspace=0.65,
-    )
-
-    save_or_show_figure(
-        figure=fig,
-        file_path=plot_config.output_dir / "01_fmcw_waveform.png",
-        should_save=plot_config.save_fmcw_waveform,
-        should_show=plot_config.show_figures,
-        dpi=plot_config.dpi,
-    )
 
 def print_result_summary(
     config: RadarConfig,
