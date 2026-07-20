@@ -174,6 +174,14 @@ class VitalSignResult:
 
     estimated_breath_frequency_hz: float
     estimated_heart_frequency_hz: float
+    used_kalman_unwrap: bool
+    kalman_recovery_succeeded: bool
+    max_true_phase_step_rad: float
+    max_recovered_phase_step_rad: float
+    phase_rmse_rad: float
+    max_phase_error_rad: float
+    cycle_slip_count: int
+    fft_correlation: float
 
 
 @dataclass(frozen=True)
@@ -193,6 +201,17 @@ class BatchRunRecord:
     estimated_heart_bpm: float
     breath_absolute_error_bpm: float
     heart_absolute_error_bpm: float
+    breath_pass: bool
+    heart_pass: bool
+    overall_pass: bool
+    used_kalman_unwrap: bool
+    kalman_recovery_succeeded: bool
+    max_true_phase_step_rad: float
+    max_recovered_phase_step_rad: float
+    phase_rmse_rad: float
+    max_phase_error_rad: float
+    cycle_slip_count: int
+    fft_correlation: float
     bpm_resolution: float
     target_range_bin: int
     estimated_range_m: float
@@ -222,6 +241,21 @@ def save_waveform_viewer_config(
         encoding="utf-8",
     )
     print(f"[已儲存網頁設定] {file_path}")
+
+
+def save_radar_config(
+    config: RadarConfig,
+    plot_config: PlotConfig,
+) -> None:
+    """儲存單次模擬的完整設定，供日後重現。"""
+
+    file_path: Path = plot_config.output_dir / "radar_config.json"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(
+        json.dumps(asdict(config), indent=2),
+        encoding="utf-8",
+    )
+    print(f"[已儲存模擬設定] {file_path}")
 
 
 def save_first_run_data(
@@ -323,6 +357,53 @@ def save_batch_results(
         )
         * 100.0
     )
+    method_1_mask: npt.NDArray[np.bool_] = np.array(
+        [not record.used_kalman_unwrap for record in records], dtype=np.bool_
+    )
+    method_2_success_mask: npt.NDArray[np.bool_] = np.array(
+        [
+            record.used_kalman_unwrap and record.kalman_recovery_succeeded
+            for record in records
+        ],
+        dtype=np.bool_,
+    )
+    method_2_failure_mask: npt.NDArray[np.bool_] = np.array(
+        [
+            record.used_kalman_unwrap and not record.kalman_recovery_succeeded
+            for record in records
+        ],
+        dtype=np.bool_,
+    )
+    effective_mask: npt.NDArray[np.bool_] = method_1_mask | method_2_success_mask
+    breath_pass_mask: npt.NDArray[np.bool_] = np.array(
+        [record.breath_pass for record in records], dtype=np.bool_
+    )
+    heart_pass_mask: npt.NDArray[np.bool_] = np.array(
+        [record.heart_pass for record in records], dtype=np.bool_
+    )
+
+    def subset_success_rate(
+        pass_mask: npt.NDArray[np.bool_], subset_mask: npt.NDArray[np.bool_]
+    ) -> float:
+        if not np.any(subset_mask):
+            return float("nan")
+        return float(np.mean(pass_mask[subset_mask]) * 100.0)
+
+    method_1_breath_rate: float = subset_success_rate(breath_pass_mask, method_1_mask)
+    method_1_heart_rate: float = subset_success_rate(heart_pass_mask, method_1_mask)
+    method_1_overall_rate: float = subset_success_rate(
+        breath_pass_mask & heart_pass_mask, method_1_mask
+    )
+    method_2_breath_rate: float = subset_success_rate(breath_pass_mask, effective_mask)
+    method_2_heart_rate: float = subset_success_rate(heart_pass_mask, effective_mask)
+    method_2_overall_rate: float = subset_success_rate(
+        breath_pass_mask & heart_pass_mask, effective_mask
+    )
+
+    def rate_change(before: float, after: float) -> str:
+        if np.isnan(before):
+            return f"N/A -> {after:.2f}%"
+        return f"{before:.2f}% -> {after:.2f}% ({after - before:+.2f} pp)"
 
     report: str = "\n".join(
         [
@@ -330,6 +411,16 @@ def save_batch_results(
             "=" * 40,
             f"Case count: {len(records)}",
             f"BPM resolution: {records[0].bpm_resolution:.6f} BPM",
+            "",
+            "Unwrap Method Comparison",
+            f"  Method 1 valid cases:                 {np.count_nonzero(method_1_mask)}",
+            f"  Method 2 added valid cases:          {np.count_nonzero(method_2_success_mask)}",
+            f"  Method 2 recovery failures analyzed: {np.count_nonzero(method_2_failure_mask)}",
+            f"  Valid cases after Method 2:          {np.count_nonzero(effective_mask)}",
+            f"  Cases completing Pass/Fail:          {len(records)}",
+            f"  Respiration success: {rate_change(method_1_breath_rate, method_2_breath_rate)}",
+            f"  Heartbeat success:   {rate_change(method_1_heart_rate, method_2_heart_rate)}",
+            f"  Overall success:     {rate_change(method_1_overall_rate, method_2_overall_rate)}",
             "",
             "Respiration",
             f"  Mean absolute error: {np.mean(breath_errors_bpm):.3f} BPM",
@@ -480,8 +571,54 @@ def estimate_peak_from_spectrum(
     return float(frequency_axis_hz[peak_index])
 
 
+def kalman_assisted_unwrap(wrapped_phase_rad: FloatArray) -> FloatArray:
+    """利用相位與相位速度 Kalman 模型選擇每筆量測的 2*pi 分支。"""
+
+    if wrapped_phase_rad.size == 0:
+        return wrapped_phase_rad.copy()
+
+    transition: FloatArray = np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+    observation: FloatArray = np.array([[1.0, 0.0]], dtype=np.float64)
+    process_covariance: FloatArray = np.array(
+        [[0.05, 0.0], [0.0, 0.50]], dtype=np.float64
+    )
+    measurement_variance: float = 0.05
+    state: FloatArray = np.array([wrapped_phase_rad[0], 0.0], dtype=np.float64)
+    covariance: FloatArray = np.diag([measurement_variance, 4.0]).astype(np.float64)
+    unwrapped_phase_rad: FloatArray = np.empty_like(wrapped_phase_rad)
+    unwrapped_phase_rad[0] = state[0]
+
+    for index in range(1, wrapped_phase_rad.size):
+        predicted_state: FloatArray = transition @ state
+        predicted_covariance: FloatArray = (
+            transition @ covariance @ transition.T + process_covariance
+        )
+        predicted_phase_rad: float = float(predicted_state[0])
+        branch_offset: float = float(
+            np.round((predicted_phase_rad - wrapped_phase_rad[index]) / (2.0 * np.pi))
+        )
+        measurement_rad: float = float(
+            wrapped_phase_rad[index] + branch_offset * 2.0 * np.pi
+        )
+        innovation_rad: float = measurement_rad - predicted_phase_rad
+        innovation_variance: float = float(
+            (observation @ predicted_covariance @ observation.T)[0, 0]
+            + measurement_variance
+        )
+        kalman_gain: FloatArray = (
+            predicted_covariance @ observation.T / innovation_variance
+        )
+        state = predicted_state + kalman_gain[:, 0] * innovation_rad
+        covariance = (
+            np.eye(2, dtype=np.float64) - kalman_gain @ observation
+        ) @ predicted_covariance
+        unwrapped_phase_rad[index] = measurement_rad
+
+    return unwrapped_phase_rad
+
+
 # -------------------------- Simulation and analysis ----------------------- #
-def simulate_and_process(config: RadarConfig) -> VitalSignResult | None:
+def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     """模擬 FMCW 雷達生命徵象訊號，並進行 Range FFT、相位解調與頻率估測。"""
 
     rng: np.random.Generator = np.random.default_rng(config.random_seed)
@@ -577,50 +714,58 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult | None:
     # ------------------------- Range Bin 相位擷取 --------------------------- #
     target_complex_data: ComplexArray = range_profile[target_range_bin, :]
     wrapped_phase_rad: FloatArray = np.angle(target_complex_data)
-    wrapped_phase_difference_rad: FloatArray = np.angle(
-        target_complex_data[1:] * np.conj(target_complex_data[:-1])
-    )
-
-    # 相位差索引 i 代表 frame i 到 i + 1，因此將 i + 1 標記為警告 frame。
-    phase_jump_threshold_rad: float = 0.9 * np.pi
-    warning_frame_indices: npt.NDArray[np.intp] = (
-        np.flatnonzero(np.abs(wrapped_phase_difference_rad) >= phase_jump_threshold_rad)
-        + 1
-    )
-
-    max_phase_step_rad = float(np.max(np.abs(wrapped_phase_difference_rad)))
-
-    print(f"Maximum adjacent wrapped phase step: " f"{max_phase_step_rad:.4f} rad")
-
-    wrapped_phase_warning: bool = warning_frame_indices.size > 0
-    if wrapped_phase_warning:
-        print(
-            "[警告] 相鄰 Frame 相位差已接近 π，"
-            "相位解包可能發生 cycle slip；"
-            f"已標記 Frame {warning_frame_indices.tolist()}。"
-        )
-
     true_vibration_phase_rad: FloatArray = (
         4.0 * np.pi * vibration_m / config.wavelength_m
     )
-
     true_phase_step_rad: FloatArray = np.diff(true_vibration_phase_rad)
+    max_true_phase_step_rad: float = float(np.max(np.abs(true_phase_step_rad)))
 
-    print(
-        "Maximum true phase step:",
-        np.max(np.abs(true_phase_step_rad)),
-        "rad",
+    used_kalman_unwrap: bool = max_true_phase_step_rad >= np.pi
+    kalman_recovery_succeeded: bool = True
+    if used_kalman_unwrap:
+        print(
+            "[方法 1 無效] 真實相鄰相位變化達到或超過 π；"
+            "改用方法 2 Kalman-assisted unwrap。"
+        )
+        extracted_phase_rad: FloatArray = kalman_assisted_unwrap(wrapped_phase_rad)
+    else:
+        extracted_phase_rad = np.unwrap(wrapped_phase_rad)
+
+    phase_offset_rad: float = float(
+        np.median(extracted_phase_rad - true_vibration_phase_rad)
     )
+    recovery_error_rad: FloatArray = (
+        extracted_phase_rad - phase_offset_rad - true_vibration_phase_rad
+    )
+    phase_rmse_rad: float = float(np.sqrt(np.mean(np.square(recovery_error_rad))))
+    max_phase_error_rad: float = float(np.max(np.abs(recovery_error_rad)))
+    max_recovered_phase_step_rad: float = float(
+        np.max(np.abs(np.diff(extracted_phase_rad)))
+    )
+    cycle_slip_count: int = int(np.count_nonzero(np.abs(true_phase_step_rad) >= np.pi))
+    true_phase_spectrum: FloatArray = np.abs(
+        np.fft.rfft(true_vibration_phase_rad - np.mean(true_vibration_phase_rad))
+    )
+    recovered_phase_spectrum: FloatArray = np.abs(
+        np.fft.rfft(extracted_phase_rad - np.mean(extracted_phase_rad))
+    )
+    if np.isclose(np.std(true_phase_spectrum), 0.0) or np.isclose(
+        np.std(recovered_phase_spectrum), 0.0
+    ):
+        fft_correlation: float = float("nan")
+    else:
+        fft_correlation = float(
+            np.corrcoef(true_phase_spectrum, recovered_phase_spectrum)[0, 1]
+        )
 
-    true_phase_warning: bool = bool(np.max(np.abs(true_phase_step_rad)) >= np.pi)
-    if true_phase_warning:
-        print("[警告] 真實相鄰相位變化達到或超過 π，" "np.unwrap 無法保證正確。")
-
-    if wrapped_phase_warning or true_phase_warning:
-        print("[略過] 本次模擬不進行後續估算，也不納入 Pass/Fail 統計。")
-        return None
-
-    extracted_phase_rad: FloatArray = np.unwrap(wrapped_phase_rad)
+    if used_kalman_unwrap:
+        kalman_recovery_succeeded = max_phase_error_rad < np.pi
+        if kalman_recovery_succeeded:
+            print("[方法 2 恢復成功] 繼續後續估算。")
+        else:
+            print(
+                "[方法 2 恢復失敗] 仍保留異常結果，" "繼續後續估算與 Pass/Fail 分析。"
+            )
 
     phase_vibration_rad: FloatArray = extracted_phase_rad - np.mean(extracted_phase_rad)
 
@@ -705,6 +850,14 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult | None:
         heartbeat_spectrum=heartbeat_spectrum,
         estimated_breath_frequency_hz=estimated_breath_frequency_hz,
         estimated_heart_frequency_hz=estimated_heart_frequency_hz,
+        used_kalman_unwrap=used_kalman_unwrap,
+        kalman_recovery_succeeded=kalman_recovery_succeeded,
+        max_true_phase_step_rad=max_true_phase_step_rad,
+        max_recovered_phase_step_rad=max_recovered_phase_step_rad,
+        phase_rmse_rad=phase_rmse_rad,
+        max_phase_error_rad=max_phase_error_rad,
+        cycle_slip_count=cycle_slip_count,
+        fft_correlation=fft_correlation,
     )
 
 
@@ -1111,49 +1264,37 @@ def print_result_summary(
 
     estimated_breath_bpm: float = result.estimated_breath_frequency_hz * 60.0
     estimated_heart_bpm: float = result.estimated_heart_frequency_hz * 60.0
-    target_range_m: float = result.range_axis_m[result.target_range_bin]
-
     print("\n" + "=" * 70)
     print("FMCW Radar Vital Sign Estimation Result")
     print("=" * 70)
-    print(f"Frame sampling rate : {config.frame_sampling_rate:.4f} Hz")
-    print(f"Frame length        : {config.frame_length}")
-    print(f"Target Range Bin    : {result.target_range_bin}")
-    print(f"Estimated Range     : {target_range_m:.4f} m")
-    print("-" * 70)
-    print("Respiration")
-    print(
-        f"  Ground Truth : {config.breath_frequency_hz:.3f} Hz "
-        f"({original_breath_bpm:.2f} BPM)"
-    )
-    print(
-        f"  Estimated    : {result.estimated_breath_frequency_hz:.3f} Hz "
-        f"({estimated_breath_bpm:.2f} BPM)"
-    )
-    print("-" * 70)
-    print("Heartbeat")
-    print(
-        f"  Ground Truth : {config.heart_frequency_hz:.3f} Hz "
-        f"({original_heart_bpm:.2f} BPM)"
-    )
-    print(
-        f"  Estimated    : {result.estimated_heart_frequency_hz:.3f} Hz "
-        f"({estimated_heart_bpm:.2f} BPM)"
-    )
+    print(f"Seed               : {config.random_seed}")
+    print()
+    print(f"Max Δφ True        : {result.max_true_phase_step_rad:.2f} rad")
+    print(f"Max Δφ Recover     : {result.max_recovered_phase_step_rad:.2f} rad")
+    print()
+    print(f"RMSE Phase         : {result.phase_rmse_rad:.2f} rad")
+    print(f"Max Error          : {result.max_phase_error_rad:.2f} rad")
+    print()
+    print(f"Cycle Slip Count   : {result.cycle_slip_count}")
+    print()
+    print(f"FFT Corr           : {result.fft_correlation:.4f}")
+    print()
+    print(f"Breath GT          : {original_breath_bpm:.2f} BPM")
+    print(f"Breath Recover     : {estimated_breath_bpm:.2f} BPM")
+    print()
+    print(f"Heart GT           : {original_heart_bpm:.2f} BPM")
+    print(f"Heart Recover      : {estimated_heart_bpm:.2f} BPM")
     print("=" * 70 + "\n")
 
 
 def main() -> None:
-    num_runs: int = 10
+    num_runs: int = 100
     output_dir: Path = Path("output")
     batch_records: list[BatchRunRecord] = []
-    skipped_run_count: int = 0
-    first_successful_run_saved: bool = False
 
     radar_config = RadarConfig(
         distance_m=1.0,
-        breath_frequency_bpm=24.0,
-        heart_frequency_bpm=96.0,
+        random_seed=42,
         add_noise=False,
     )
     specific_configs: tuple[RadarConfig, ...] = ()
@@ -1166,15 +1307,15 @@ def main() -> None:
 
         print(f"\n開始第 {run_number}/{len(run_configs)} 次模擬")
 
-        result: VitalSignResult | None = simulate_and_process(run_config)
-        if result is None:
-            skipped_run_count += 1
-            continue
+        result: VitalSignResult = simulate_and_process(run_config)
 
         print_result_summary(run_config, result)
 
         estimated_breath_bpm: float = result.estimated_breath_frequency_hz * 60.0
         estimated_heart_bpm: float = result.estimated_heart_frequency_hz * 60.0
+        breath_absolute_error_bpm: float = abs(
+            estimated_breath_bpm - run_config.breath_frequency_bpm
+        )
         heart_absolute_error_bpm: float = abs(
             estimated_heart_bpm - run_config.heart_frequency_bpm
         )
@@ -1194,11 +1335,23 @@ def main() -> None:
                 heart_bpm=run_config.heart_frequency_bpm,
                 snr_db=run_config.snr_db,
                 estimated_breath_bpm=estimated_breath_bpm,
-                breath_absolute_error_bpm=abs(
-                    estimated_breath_bpm - run_config.breath_frequency_bpm
-                ),
+                breath_absolute_error_bpm=breath_absolute_error_bpm,
                 estimated_heart_bpm=estimated_heart_bpm,
                 heart_absolute_error_bpm=heart_absolute_error_bpm,
+                breath_pass=breath_absolute_error_bpm <= bpm_resolution,
+                heart_pass=heart_absolute_error_bpm <= bpm_resolution,
+                overall_pass=(
+                    breath_absolute_error_bpm <= bpm_resolution
+                    and heart_absolute_error_bpm <= bpm_resolution
+                ),
+                used_kalman_unwrap=result.used_kalman_unwrap,
+                kalman_recovery_succeeded=(result.kalman_recovery_succeeded),
+                max_true_phase_step_rad=result.max_true_phase_step_rad,
+                max_recovered_phase_step_rad=(result.max_recovered_phase_step_rad),
+                phase_rmse_rad=result.phase_rmse_rad,
+                max_phase_error_rad=result.max_phase_error_rad,
+                cycle_slip_count=result.cycle_slip_count,
+                fft_correlation=result.fft_correlation,
                 bpm_resolution=bpm_resolution,
                 target_range_bin=result.target_range_bin,
                 estimated_range_m=estimated_range_m,
@@ -1206,7 +1359,7 @@ def main() -> None:
             )
         )
 
-        if not first_successful_run_saved:
+        if run_index == 0:
             plot_config = PlotConfig(
                 output_dir=output_dir,
                 show_figures=False,
@@ -1217,11 +1370,14 @@ def main() -> None:
                 config=run_config,
                 plot_config=plot_config,
             )
-
-            #save_first_run_data(
-            #    result=result,
-            #    output_dir=output_dir,
-            #)
+            save_radar_config(
+                config=run_config,
+                plot_config=plot_config,
+            )
+            # save_first_run_data(
+            #     result=result,
+            #     output_dir=output_dir,
+            # )
 
             # 僅儲存第一次測試的 FMCW 與生命徵象圖。
             plot_transmitted_fmcw_waveform(
@@ -1233,20 +1389,32 @@ def main() -> None:
                 result=result,
                 plot_config=plot_config,
             )
-            first_successful_run_saved = True
 
-    print(
-        f"\n模擬完成：有效 {len(batch_records)} 次，"
-        f"因相位警告略過 {skipped_run_count} 次。"
+    method_1_valid_count: int = sum(
+        not record.used_kalman_unwrap for record in batch_records
     )
-    if batch_records:
-        save_batch_results(
-            records=batch_records,
-            output_dir=output_dir,
-            success_tolerance_bpm=batch_records[0].bpm_resolution,
-        )
-    else:
-        print("[警告] 沒有可納入 Pass/Fail 統計的有效模擬結果。")
+    method_2_added_count: int = sum(
+        record.used_kalman_unwrap and record.kalman_recovery_succeeded
+        for record in batch_records
+    )
+    method_2_failure_count: int = sum(
+        record.used_kalman_unwrap and not record.kalman_recovery_succeeded
+        for record in batch_records
+    )
+    print("\nUnwrap 方法比較：")
+    print(f"  方法 1 原本有效：       {method_1_valid_count} 次")
+    print(f"  方法 2 增加有效：       {method_2_added_count} 次")
+    print(f"  方法 2 恢復失敗：       {method_2_failure_count} 次（仍納入分析）")
+    print(
+        "  加入方法 2 後總有效：  " f"{method_1_valid_count + method_2_added_count} 次"
+    )
+    print(f"  完成 Pass/Fail：         {len(batch_records)} 次")
+
+    save_batch_results(
+        records=batch_records,
+        output_dir=output_dir,
+        success_tolerance_bpm=batch_records[0].bpm_resolution,
+    )
 
 
 if __name__ == "__main__":
