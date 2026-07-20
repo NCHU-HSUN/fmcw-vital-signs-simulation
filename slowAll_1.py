@@ -2,7 +2,8 @@ from __future__ import annotations
 
 # pyright: reportUnknownMemberType=false
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+import csv
 import json
 from pathlib import Path
 
@@ -11,7 +12,6 @@ import numpy as np
 import numpy.typing as npt
 from matplotlib.figure import Figure
 from scipy.signal import butter, filtfilt
-
 
 FloatArray = npt.NDArray[np.float64]
 ComplexArray = npt.NDArray[np.complex128]
@@ -56,11 +56,11 @@ class RadarConfig:
     add_noise: bool = False
     random_seed: int = 42
 
-    breath_cut_search_low_bpm: float = 5.0
-    breath_cut_search_high_bpm: float = 120.0
-    heart_cut_search_low_bpm: float = 60.0
-    heart_cut_search_high_bpm: float = 200.0
-
+    # --------------------------- 頻率搜尋範圍 ------------------------- #
+    breath_cut_search_low_bpm: float = 6.0
+    breath_cut_search_high_bpm: float = 30.0
+    heart_cut_search_low_bpm: float = 48.0
+    heart_cut_search_high_bpm: float = 120.0
 
     @property
     def wavelength_m(self) -> float:
@@ -89,18 +89,51 @@ class RadarConfig:
     @property
     def breath_frequency_hz(self) -> float:
         return self.breath_frequency_bpm / 60.0
+
     @property
     def breath_cut_search_low_hz(self) -> float:
         return self.breath_cut_search_low_bpm / 60.0
+
     @property
     def breath_cut_search_high_hz(self) -> float:
         return self.breath_cut_search_high_bpm / 60.0
+
     @property
     def heart_cut_search_low_hz(self) -> float:
         return self.heart_cut_search_low_bpm / 60.0
+
     @property
     def heart_cut_search_high_hz(self) -> float:
         return self.heart_cut_search_high_bpm / 60.0
+
+    def randomized_for_run(self, run_index: int) -> RadarConfig:
+        """從頻率搜尋範圍內產生可重現的單次測試設定。"""
+
+        run_seed: int = self.random_seed + run_index
+        rng: np.random.Generator = np.random.default_rng(run_seed)
+
+        return replace(
+            self,
+            distance_m=float(rng.uniform(0.5, 2.0)),
+            velocity_mps=float(rng.uniform(-0.1, 0.1)),
+            breath_amplitude_m=float(rng.uniform(1.0e-3, 4.0e-3)),
+            breath_frequency_bpm=float(
+                rng.uniform(
+                    self.breath_cut_search_low_bpm,
+                    self.breath_cut_search_high_bpm,
+                )
+            ),
+            heart_amplitude_m=float(rng.uniform(0.2e-3, 0.8e-3)),
+            heart_frequency_bpm=float(
+                rng.uniform(
+                    self.heart_cut_search_low_bpm,
+                    self.heart_cut_search_high_bpm,
+                )
+            ),
+            snr_db=float(rng.uniform(10.0, 30.0)),
+            add_noise=True,
+            random_seed=run_seed,
+        )
 
 
 @dataclass(frozen=True)
@@ -143,6 +176,29 @@ class VitalSignResult:
     estimated_heart_frequency_hz: float
 
 
+@dataclass(frozen=True)
+class BatchRunRecord:
+    """單次批次模擬的設定與估測結果。"""
+
+    run_number: int
+    random_seed: int
+    distance_m: float
+    velocity_mps: float
+    snr_db: float
+    breath_amplitude_mm: float
+    breath_bpm: float
+    heart_amplitude_mm: float
+    heart_bpm: float
+    estimated_breath_bpm: float
+    estimated_heart_bpm: float
+    breath_absolute_error_bpm: float
+    heart_absolute_error_bpm: float
+    bpm_resolution: float
+    target_range_bin: int
+    estimated_range_m: float
+    range_absolute_error_m: float
+
+
 # ----------------------------- Output helpers ----------------------------- #
 def save_waveform_viewer_config(
     config: RadarConfig,
@@ -166,6 +222,142 @@ def save_waveform_viewer_config(
         encoding="utf-8",
     )
     print(f"[已儲存網頁設定] {file_path}")
+
+
+def save_first_run_data(
+    result: VitalSignResult,
+    output_dir: Path,
+) -> None:
+    """儲存第一輪生命徵象估算的逐點資料。"""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    time_domain_path: Path = output_dir / "first_run_time_domain.csv"
+
+    with time_domain_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(
+            [
+                "time_s",
+                "ground_truth_breath_mm",
+                "ground_truth_heart_mm",
+                "estimated_respiration_mm",
+                "estimated_heartbeat_mm",
+            ]
+        )
+        writer.writerows(
+            (
+                result.time_s[index],
+                result.ground_truth_breath_mm[index],
+                result.ground_truth_heart_mm[index],
+                result.estimated_respiration_mm[index],
+                result.estimated_heartbeat_mm[index],
+            )
+            for index in range(result.time_s.size)
+        )
+
+    frequency_domain_path: Path = output_dir / "first_run_frequency_domain.csv"
+
+    with frequency_domain_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(
+            [
+                "frequency_hz",
+                "respiration_spectrum",
+                "heartbeat_spectrum",
+            ]
+        )
+        writer.writerows(
+            (
+                result.frequency_axis_hz[index],
+                result.respiration_spectrum[index],
+                result.heartbeat_spectrum[index],
+            )
+            for index in range(result.frequency_axis_hz.size)
+        )
+
+    print(f"[已儲存時域資料] {time_domain_path}")
+    print(f"[已儲存頻域資料] {frequency_domain_path}")
+
+
+def save_batch_results(
+    records: list[BatchRunRecord],
+    output_dir: Path,
+    success_tolerance_bpm: float,
+) -> None:
+    """將所有批次測試結果與頻率誤差統計輸出為檔案。"""
+
+    if not records:
+        raise ValueError("至少需要一筆批次測試結果。")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path: Path = output_dir / "batch_results.csv"
+    field_names: list[str] = list(asdict(records[0]))
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=field_names)
+        writer.writeheader()
+        writer.writerows(asdict(record) for record in records)
+
+    breath_errors_bpm: FloatArray = np.array(
+        [record.breath_absolute_error_bpm for record in records],
+        dtype=np.float64,
+    )
+    heart_errors_bpm: FloatArray = np.array(
+        [record.heart_absolute_error_bpm for record in records],
+        dtype=np.float64,
+    )
+    range_errors_m: FloatArray = np.array(
+        [record.range_absolute_error_m for record in records],
+        dtype=np.float64,
+    )
+    breath_success_rate: float = float(
+        np.mean(breath_errors_bpm <= success_tolerance_bpm) * 100.0
+    )
+    heart_success_rate: float = float(
+        np.mean(heart_errors_bpm <= success_tolerance_bpm) * 100.0
+    )
+    overall_success_rate: float = float(
+        np.mean(
+            (breath_errors_bpm <= success_tolerance_bpm)
+            & (heart_errors_bpm <= success_tolerance_bpm)
+        )
+        * 100.0
+    )
+
+    report: str = "\n".join(
+        [
+            "FMCW Vital-Sign Batch Statistics",
+            "=" * 40,
+            f"Case count: {len(records)}",
+            f"BPM resolution: {records[0].bpm_resolution:.6f} BPM",
+            "",
+            "Respiration",
+            f"  Mean absolute error: {np.mean(breath_errors_bpm):.3f} BPM",
+            f"  Max absolute error:  {np.max(breath_errors_bpm):.3f} BPM",
+            f"  Success rate:        {breath_success_rate:.2f}%",
+            "",
+            "Heartbeat (Original Flow)",
+            f"  Mean absolute error: {np.mean(heart_errors_bpm):.3f} BPM",
+            f"  Max absolute error:  {np.max(heart_errors_bpm):.3f} BPM",
+            f"  Success rate:        {heart_success_rate:.2f}%",
+            "",
+            "Range",
+            f"  Mean absolute error: {np.mean(range_errors_m):.4f} m",
+            f"  Max absolute error:  {np.max(range_errors_m):.4f} m",
+            "",
+            "Overall",
+            (
+                "  Success rate (both respiration and heartbeat within "
+                f"tolerance): {overall_success_rate:.2f}%"
+            ),
+        ]
+    )
+    report_path: Path = output_dir / "batch_statistics_report.txt"
+    report_path.write_text(report + "\n", encoding="utf-8")
+
+    print(f"[已儲存批次結果] {csv_path}")
+    print(f"[已儲存統計報告] {report_path}")
+    print("\n" + report)
 
 
 def save_or_show_figure(
@@ -255,9 +447,26 @@ def estimate_peak_frequency(
         d=1.0 / sampling_rate_hz,
     )
 
-    valid_mask: npt.NDArray[np.bool_] = (
-        (frequency_axis >= search_low_hz)
-        & (frequency_axis <= search_high_hz)
+    estimated_frequency_hz: float = estimate_peak_from_spectrum(
+        frequency_axis_hz=frequency_axis,
+        magnitude_spectrum=spectrum,
+        search_low_hz=search_low_hz,
+        search_high_hz=search_high_hz,
+    )
+
+    return estimated_frequency_hz, frequency_axis, spectrum
+
+
+def estimate_peak_from_spectrum(
+    frequency_axis_hz: FloatArray,
+    magnitude_spectrum: FloatArray,
+    search_low_hz: float,
+    search_high_hz: float,
+) -> float:
+    """在指定頻率搜尋範圍內回傳頻譜最大峰值。"""
+
+    valid_mask: npt.NDArray[np.bool_] = (frequency_axis_hz >= search_low_hz) & (
+        frequency_axis_hz <= search_high_hz
     )
 
     valid_indices: npt.NDArray[np.int64] = np.where(valid_mask)[0]
@@ -265,16 +474,14 @@ def estimate_peak_frequency(
     if valid_indices.size == 0:
         raise ValueError("指定頻率搜尋範圍內沒有 FFT bin。")
 
-    local_peak_index: int = int(np.argmax(spectrum[valid_indices]))
+    local_peak_index: int = int(np.argmax(magnitude_spectrum[valid_indices]))
     peak_index: int = int(valid_indices[local_peak_index])
 
-    estimated_frequency_hz: float = float(frequency_axis[peak_index])
-
-    return estimated_frequency_hz, frequency_axis, spectrum
+    return float(frequency_axis_hz[peak_index])
 
 
 # -------------------------- Simulation and analysis ----------------------- #
-def simulate_and_process(config: RadarConfig) -> VitalSignResult:
+def simulate_and_process(config: RadarConfig) -> VitalSignResult | None:
     """模擬 FMCW 雷達生命徵象訊號，並進行 Range FFT、相位解調與頻率估測。"""
 
     rng: np.random.Generator = np.random.default_rng(config.random_seed)
@@ -286,19 +493,16 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     )
 
     frame_time: FloatArray = (
-        np.arange(config.frame_length, dtype=np.float64)
-        * config.frame_periodicity
+        np.arange(config.frame_length, dtype=np.float64) * config.frame_periodicity
     )
 
     # ------------------------- 原始呼吸 / 心跳位移 -------------------------- #
-    ground_truth_breath_m: FloatArray = (
-        config.breath_amplitude_m
-        * np.sin(2.0 * np.pi * config.breath_frequency_hz * frame_time)
+    ground_truth_breath_m: FloatArray = config.breath_amplitude_m * np.sin(
+        2.0 * np.pi * config.breath_frequency_hz * frame_time
     )
 
-    ground_truth_heart_m: FloatArray = (
-        config.heart_amplitude_m
-        * np.sin(2.0 * np.pi * config.heart_frequency_hz * frame_time)
+    ground_truth_heart_m: FloatArray = config.heart_amplitude_m * np.sin(
+        2.0 * np.pi * config.heart_frequency_hz * frame_time
     )
 
     vibration_m: FloatArray = ground_truth_breath_m + ground_truth_heart_m
@@ -311,18 +515,11 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     )
 
     # fd = 2 * velocity * fc / c
-    doppler_frequency_hz: float = (
-        2.0 * config.velocity_mps * config.fc / config.c
-    )
+    doppler_frequency_hz: float = 2.0 * config.velocity_mps * config.fc / config.c
 
     # C1 = exp(j * 2*pi*fc*2R/c)
     carrier_phase: FloatArray = (
-        2.0
-        * np.pi
-        * config.fc
-        * 2.0
-        * target_distance_m
-        / config.c
+        2.0 * np.pi * config.fc * 2.0 * target_distance_m / config.c
     )
 
     # 建立 [fast_time, frame] 的矩陣
@@ -338,9 +535,9 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     signal_power: float = 10.0 ** (config.snr_db / 10.0)
     signal_amplitude: float = np.sqrt(signal_power)
 
-    if_signal: ComplexArray = (
-        signal_amplitude * np.exp(1j * phase_total)
-    ).astype(np.complex128)
+    if_signal: ComplexArray = (signal_amplitude * np.exp(1j * phase_total)).astype(
+        np.complex128
+    )
 
     if config.add_noise:
         noise_power: float = 1.0
@@ -374,17 +571,58 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     # FMCW range resolution = c / (2 * BW)
     range_resolution_m: float = config.c / (2.0 * config.bandwidth_hz)
     range_axis_m: FloatArray = (
-        np.arange(config.num_fast_time_samples, dtype=np.float64)
-        * range_resolution_m
+        np.arange(config.num_fast_time_samples, dtype=np.float64) * range_resolution_m
     )
 
     # ------------------------- Range Bin 相位擷取 --------------------------- #
     target_complex_data: ComplexArray = range_profile[target_range_bin, :]
-    extracted_phase_rad: FloatArray = np.unwrap(np.angle(target_complex_data))
-
-    phase_vibration_rad: FloatArray = (
-        extracted_phase_rad - np.mean(extracted_phase_rad)
+    wrapped_phase_rad: FloatArray = np.angle(target_complex_data)
+    wrapped_phase_difference_rad: FloatArray = np.angle(
+        target_complex_data[1:] * np.conj(target_complex_data[:-1])
     )
+
+    # 相位差索引 i 代表 frame i 到 i + 1，因此將 i + 1 標記為警告 frame。
+    phase_jump_threshold_rad: float = 0.9 * np.pi
+    warning_frame_indices: npt.NDArray[np.intp] = (
+        np.flatnonzero(np.abs(wrapped_phase_difference_rad) >= phase_jump_threshold_rad)
+        + 1
+    )
+
+    max_phase_step_rad = float(np.max(np.abs(wrapped_phase_difference_rad)))
+
+    print(f"Maximum adjacent wrapped phase step: " f"{max_phase_step_rad:.4f} rad")
+
+    wrapped_phase_warning: bool = warning_frame_indices.size > 0
+    if wrapped_phase_warning:
+        print(
+            "[警告] 相鄰 Frame 相位差已接近 π，"
+            "相位解包可能發生 cycle slip；"
+            f"已標記 Frame {warning_frame_indices.tolist()}。"
+        )
+
+    true_vibration_phase_rad: FloatArray = (
+        4.0 * np.pi * vibration_m / config.wavelength_m
+    )
+
+    true_phase_step_rad: FloatArray = np.diff(true_vibration_phase_rad)
+
+    print(
+        "Maximum true phase step:",
+        np.max(np.abs(true_phase_step_rad)),
+        "rad",
+    )
+
+    true_phase_warning: bool = bool(np.max(np.abs(true_phase_step_rad)) >= np.pi)
+    if true_phase_warning:
+        print("[警告] 真實相鄰相位變化達到或超過 π，" "np.unwrap 無法保證正確。")
+
+    if wrapped_phase_warning or true_phase_warning:
+        print("[略過] 本次模擬不進行後續估算，也不納入 Pass/Fail 統計。")
+        return None
+
+    extracted_phase_rad: FloatArray = np.unwrap(wrapped_phase_rad)
+
+    phase_vibration_rad: FloatArray = extracted_phase_rad - np.mean(extracted_phase_rad)
 
     # Phase -> displacement:
     # phase = 4*pi*displacement/lambda
@@ -433,7 +671,6 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         search_low_hz=config.breath_cut_search_low_hz,
         search_high_hz=config.breath_cut_search_high_hz,
     )
-
     estimated_heart_frequency_hz: float
     heartbeat_frequency_axis_hz: FloatArray
     heartbeat_spectrum: FloatArray
@@ -448,8 +685,7 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         search_low_hz=config.heart_cut_search_low_hz,
         search_high_hz=config.heart_cut_search_high_hz,
     )
-
-    # 確認兩者 FFT frequency axis 相同
+    # 確認呼吸與心跳 FFT frequency axis 相同
     if not np.allclose(frequency_axis_hz, heartbeat_frequency_axis_hz):
         raise RuntimeError("呼吸與心跳的頻率軸不一致。")
 
@@ -471,6 +707,7 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         estimated_heart_frequency_hz=estimated_heart_frequency_hz,
     )
 
+
 # --------------------------------- Plotting -------------------------------- #
 def plot_transmitted_fmcw_waveform(
     config: RadarConfig,
@@ -479,13 +716,10 @@ def plot_transmitted_fmcw_waveform(
     """繪製一個 frame 中尚未混頻的 FMCW 發射 RF 波形。"""
 
     chirps_per_frame: int = config.chirps_per_loop * config.num_loops
-    active_frame_duration_s: float = (
-        chirps_per_frame * config.chirp_period
-    )
+    active_frame_duration_s: float = chirps_per_frame * config.chirp_period
     capture_duration_s: float = config.frame_length * config.frame_periodicity
     frame_start_times_s: FloatArray = (
-        np.arange(config.frame_length, dtype=np.float64)
-        * config.frame_periodicity
+        np.arange(config.frame_length, dtype=np.float64) * config.frame_periodicity
     )
 
     transmit_gate_time_s: list[float] = []
@@ -493,9 +727,7 @@ def plot_transmitted_fmcw_waveform(
 
     for frame_start_s in frame_start_times_s:
         for chirp_index in range(chirps_per_frame):
-            chirp_start_s: float = (
-                frame_start_s + chirp_index * config.chirp_period
-            )
+            chirp_start_s: float = frame_start_s + chirp_index * config.chirp_period
             chirp_end_s: float = chirp_start_s + config.chirp_duration
             transmit_gate_time_s.extend(
                 [chirp_start_s, chirp_start_s, chirp_end_s, chirp_end_s]
@@ -522,10 +754,7 @@ def plot_transmitted_fmcw_waveform(
     transmitted_signal: FloatArray = np.cos(
         2.0
         * np.pi
-        * (
-            config.fc * waveform_time
-            + 0.5 * config.chirp_slope * waveform_time**2
-        )
+        * (config.fc * waveform_time + 0.5 * config.chirp_slope * waveform_time**2)
     )
 
     fig, axes = plt.subplots(
@@ -550,10 +779,13 @@ def plot_transmitted_fmcw_waveform(
     for chirp_index in range(chirps_per_frame):
         chirp_start_s: float = chirp_index * config.chirp_period
         chirp_end_s: float = chirp_start_s + config.chirp_duration
-        chirp_frequency_ghz: FloatArray = np.array(
-            [config.fc, config.fc + config.bandwidth_hz],
-            dtype=np.float64,
-        ) / 1.0e9
+        chirp_frequency_ghz: FloatArray = (
+            np.array(
+                [config.fc, config.fc + config.bandwidth_hz],
+                dtype=np.float64,
+            )
+            / 1.0e9
+        )
 
         axes[1].plot(
             np.array([chirp_start_s, chirp_end_s]) * 1.0e6,
@@ -618,8 +850,8 @@ def plot_vital_sign_summary(
 
     第 1 張：Range Profile
     第 2 張：原始位移與雷達估計位移
-    第 3 張：呼吸與心跳帶通濾波結果
-    第 4 張：呼吸與心跳頻譜與峰值估計
+    第 3 張：呼吸與心跳帶通結果
+    第 4 張：呼吸與心跳頻譜
     """
 
     fig, axes = plt.subplots(
@@ -749,7 +981,7 @@ def plot_vital_sign_summary(
         result.estimated_heartbeat_mm,
         color="tab:red",
         linewidth=1.2,
-        label="Estimated Heart",
+        label="Estimated Heart (Original Flow)",
     )
 
     filtered_ax.set_title("3. Bandpass Filtered Respiration and Heartbeat")
@@ -765,22 +997,15 @@ def plot_vital_sign_summary(
 
     breath_peak_index: int = int(
         np.argmin(
-            np.abs(
-                result.frequency_axis_hz
-                - result.estimated_breath_frequency_hz
-            )
+            np.abs(result.frequency_axis_hz - result.estimated_breath_frequency_hz)
         )
     )
 
     heart_peak_index: int = int(
         np.argmin(
-            np.abs(
-                result.frequency_axis_hz
-                - result.estimated_heart_frequency_hz
-            )
+            np.abs(result.frequency_axis_hz - result.estimated_heart_frequency_hz)
         )
     )
-
     spectrum_ax.plot(
         result.frequency_axis_hz,
         result.respiration_spectrum,
@@ -794,7 +1019,7 @@ def plot_vital_sign_summary(
         result.heartbeat_spectrum,
         color="tab:red",
         linewidth=1.5,
-        label="Heartbeat Spectrum",
+        label="Heartbeat Spectrum (Original Flow)",
     )
 
     spectrum_ax.plot(
@@ -886,7 +1111,6 @@ def print_result_summary(
 
     estimated_breath_bpm: float = result.estimated_breath_frequency_hz * 60.0
     estimated_heart_bpm: float = result.estimated_heart_frequency_hz * 60.0
-
     target_range_m: float = result.range_axis_m[result.target_range_bin]
 
     print("\n" + "=" * 70)
@@ -920,41 +1144,109 @@ def print_result_summary(
 
 
 def main() -> None:
+    num_runs: int = 10
+    output_dir: Path = Path("output")
+    batch_records: list[BatchRunRecord] = []
+    skipped_run_count: int = 0
+    first_successful_run_saved: bool = False
+
     radar_config = RadarConfig(
         distance_m=1.0,
-        breath_frequency_bpm=15.0,
-        heart_frequency_bpm=180.0,
+        breath_frequency_bpm=24.0,
+        heart_frequency_bpm=96.0,
         add_noise=False,
     )
-
-    plot_config = PlotConfig(
-        output_dir=Path("output"),
-        show_figures=False,
-        save_fmcw_waveform=True,
-        save_vital_sign_summary=True,
+    specific_configs: tuple[RadarConfig, ...] = ()
+    run_configs: tuple[RadarConfig, ...] = specific_configs or tuple(
+        radar_config.randomized_for_run(run_index) for run_index in range(num_runs)
     )
 
-    save_waveform_viewer_config(
-        config=radar_config,
-        plot_config=plot_config,
+    for run_index, run_config in enumerate(run_configs):
+        run_number: int = run_index + 1
+
+        print(f"\n開始第 {run_number}/{len(run_configs)} 次模擬")
+
+        result: VitalSignResult | None = simulate_and_process(run_config)
+        if result is None:
+            skipped_run_count += 1
+            continue
+
+        print_result_summary(run_config, result)
+
+        estimated_breath_bpm: float = result.estimated_breath_frequency_hz * 60.0
+        estimated_heart_bpm: float = result.estimated_heart_frequency_hz * 60.0
+        heart_absolute_error_bpm: float = abs(
+            estimated_heart_bpm - run_config.heart_frequency_bpm
+        )
+        bpm_resolution: float = (
+            run_config.frame_sampling_rate / run_config.frame_length * 60.0
+        )
+        estimated_range_m: float = float(result.range_axis_m[result.target_range_bin])
+        batch_records.append(
+            BatchRunRecord(
+                run_number=run_number,
+                random_seed=run_config.random_seed,
+                distance_m=run_config.distance_m,
+                velocity_mps=run_config.velocity_mps,
+                breath_amplitude_mm=run_config.breath_amplitude_m * 1000.0,
+                breath_bpm=run_config.breath_frequency_bpm,
+                heart_amplitude_mm=run_config.heart_amplitude_m * 1000.0,
+                heart_bpm=run_config.heart_frequency_bpm,
+                snr_db=run_config.snr_db,
+                estimated_breath_bpm=estimated_breath_bpm,
+                breath_absolute_error_bpm=abs(
+                    estimated_breath_bpm - run_config.breath_frequency_bpm
+                ),
+                estimated_heart_bpm=estimated_heart_bpm,
+                heart_absolute_error_bpm=heart_absolute_error_bpm,
+                bpm_resolution=bpm_resolution,
+                target_range_bin=result.target_range_bin,
+                estimated_range_m=estimated_range_m,
+                range_absolute_error_m=abs(estimated_range_m - run_config.distance_m),
+            )
+        )
+
+        if not first_successful_run_saved:
+            plot_config = PlotConfig(
+                output_dir=output_dir,
+                show_figures=False,
+                save_fmcw_waveform=True,
+                save_vital_sign_summary=True,
+            )
+            save_waveform_viewer_config(
+                config=run_config,
+                plot_config=plot_config,
+            )
+
+            #save_first_run_data(
+            #    result=result,
+            #    output_dir=output_dir,
+            #)
+
+            # 僅儲存第一次測試的 FMCW 與生命徵象圖。
+            plot_transmitted_fmcw_waveform(
+                config=run_config,
+                plot_config=plot_config,
+            )
+            plot_vital_sign_summary(
+                config=run_config,
+                result=result,
+                plot_config=plot_config,
+            )
+            first_successful_run_saved = True
+
+    print(
+        f"\n模擬完成：有效 {len(batch_records)} 次，"
+        f"因相位警告略過 {skipped_run_count} 次。"
     )
-
-    # 圖 1：FMCW 發射 RF 波形（尚未產生 IF 或執行 Range FFT）
-    plot_transmitted_fmcw_waveform(
-        config=radar_config,
-        plot_config=plot_config,
-    )
-
-    result: VitalSignResult = simulate_and_process(radar_config)
-
-    print_result_summary(radar_config, result)
-
-    # 圖 2：生命徵象總覽圖
-    plot_vital_sign_summary(
-        config=radar_config,
-        result=result,
-        plot_config=plot_config,
-    )
+    if batch_records:
+        save_batch_results(
+            records=batch_records,
+            output_dir=output_dir,
+            success_tolerance_bpm=batch_records[0].bpm_resolution,
+        )
+    else:
+        print("[警告] 沒有可納入 Pass/Fail 統計的有效模擬結果。")
 
 
 if __name__ == "__main__":
