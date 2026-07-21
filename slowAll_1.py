@@ -156,6 +156,36 @@ class PlotConfig:
     # Range Profile、位移、濾波結果、頻譜合併圖
     save_vital_sign_summary: bool = True
 
+    # True / Recovered phase 與分支變更位置
+    save_phase_branch_diagnostics: bool = True
+
+    # 流程 A（M1 -> M2 -> M3）與流程 B（M1 -> M3）比較
+    save_flow_comparison: bool = True
+
+
+@dataclass(frozen=True)
+class PhaseFlowResult:
+    """單一 unwrap 流程的相位、分支與生命徵象評估結果。"""
+
+    recovered_phase_rad: FloatArray
+    branch_error_index: npt.NDArray[np.int64]
+    branch_change_frames: npt.NDArray[np.int64]
+    estimated_displacement_mm: FloatArray
+    estimated_respiration_mm: FloatArray
+    estimated_heartbeat_mm: FloatArray
+    frequency_axis_hz: FloatArray
+    respiration_spectrum: FloatArray
+    heartbeat_spectrum: FloatArray
+    estimated_breath_frequency_hz: float
+    estimated_heart_frequency_hz: float
+    recovery_succeeded: bool
+    max_recovered_phase_step_rad: float
+    phase_rmse_rad: float
+    max_phase_error_rad: float
+    actual_branch_change_count: int
+    wrong_branch_frame_count: int
+    fft_correlation: float
+
 
 @dataclass(frozen=True)
 class VitalSignResult:
@@ -169,6 +199,10 @@ class VitalSignResult:
     ground_truth_breath_mm: FloatArray
     ground_truth_heart_mm: FloatArray
     ground_truth_total_mm: FloatArray
+    true_vibration_phase_rad: FloatArray
+    recovered_phase_rad: FloatArray
+    branch_error_index: npt.NDArray[np.int64]
+    branch_change_frames: npt.NDArray[np.int64]
 
     estimated_displacement_mm: FloatArray
     estimated_respiration_mm: FloatArray
@@ -188,8 +222,12 @@ class VitalSignResult:
     max_recovered_phase_step_rad: float
     phase_rmse_rad: float
     max_phase_error_rad: float
-    cycle_slip_count: int
+    true_phase_risk_count: int
+    actual_branch_change_count: int
+    wrong_branch_frame_count: int
     fft_correlation: float
+    primary_flow_recovery_succeeded: bool
+    direct_dp_flow: PhaseFlowResult
 
 
 @dataclass(frozen=True)
@@ -220,12 +258,27 @@ class BatchRunRecord:
     max_recovered_phase_step_rad: float
     phase_rmse_rad: float
     max_phase_error_rad: float
-    cycle_slip_count: int
+    true_phase_risk_count: int
+    actual_branch_change_count: int
+    wrong_branch_frame_count: int
     fft_correlation: float
     bpm_resolution: float
     target_range_bin: int
     estimated_range_m: float
     range_absolute_error_m: float
+    flow_a_recovery_succeeded: bool
+    flow_b_recovery_succeeded: bool
+    flow_b_phase_rmse_rad: float
+    flow_b_max_phase_error_rad: float
+    flow_b_actual_branch_change_count: int
+    flow_b_wrong_branch_frame_count: int
+    flow_b_estimated_breath_bpm: float
+    flow_b_estimated_heart_bpm: float
+    flow_b_breath_absolute_error_bpm: float
+    flow_b_heart_absolute_error_bpm: float
+    flow_b_breath_pass: bool
+    flow_b_heart_pass: bool
+    flow_b_overall_pass: bool
 
 
 # ----------------------------- Output helpers ----------------------------- #
@@ -350,6 +403,14 @@ def save_batch_results(
         [record.heart_absolute_error_bpm for record in records],
         dtype=np.float64,
     )
+    flow_b_breath_errors_bpm: FloatArray = np.array(
+        [record.flow_b_breath_absolute_error_bpm for record in records],
+        dtype=np.float64,
+    )
+    flow_b_heart_errors_bpm: FloatArray = np.array(
+        [record.flow_b_heart_absolute_error_bpm for record in records],
+        dtype=np.float64,
+    )
     range_errors_m: FloatArray = np.array(
         [record.range_absolute_error_m for record in records],
         dtype=np.float64,
@@ -370,6 +431,7 @@ def save_batch_results(
     method_1_mask: npt.NDArray[np.bool_] = np.array(
         [not record.used_kalman_unwrap for record in records], dtype=np.bool_
     )
+    method_1_failure_mask: npt.NDArray[np.bool_] = ~method_1_mask
     method_2_success_mask: npt.NDArray[np.bool_] = np.array(
         [
             record.used_kalman_unwrap and record.kalman_recovery_succeeded
@@ -447,6 +509,61 @@ def save_batch_results(
             return f"N/A -> {after:.2f}%"
         return f"{before:.2f}% -> {after:.2f}% ({after - before:+.2f} pp)"
 
+    def masked_mean(values: FloatArray) -> float:
+        if not np.any(method_1_failure_mask):
+            return float("nan")
+        return float(np.mean(values[method_1_failure_mask]))
+
+    flow_a_recovery_mask: npt.NDArray[np.bool_] = np.array(
+        [record.flow_a_recovery_succeeded for record in records], dtype=np.bool_
+    )
+    flow_b_recovery_mask: npt.NDArray[np.bool_] = np.array(
+        [record.flow_b_recovery_succeeded for record in records], dtype=np.bool_
+    )
+    flow_a_rmse_rad: FloatArray = np.array(
+        [record.phase_rmse_rad for record in records], dtype=np.float64
+    )
+    flow_b_rmse_rad: FloatArray = np.array(
+        [record.flow_b_phase_rmse_rad for record in records], dtype=np.float64
+    )
+    flow_a_wrong_frames: FloatArray = np.array(
+        [record.wrong_branch_frame_count for record in records], dtype=np.float64
+    )
+    flow_b_wrong_frames: FloatArray = np.array(
+        [record.flow_b_wrong_branch_frame_count for record in records],
+        dtype=np.float64,
+    )
+    flow_a_branch_changes: FloatArray = np.array(
+        [record.actual_branch_change_count for record in records], dtype=np.float64
+    )
+    flow_b_branch_changes: FloatArray = np.array(
+        [record.flow_b_actual_branch_change_count for record in records],
+        dtype=np.float64,
+    )
+    flow_b_breath_pass_mask: npt.NDArray[np.bool_] = np.array(
+        [record.flow_b_breath_pass for record in records], dtype=np.bool_
+    )
+    flow_b_heart_pass_mask: npt.NDArray[np.bool_] = np.array(
+        [record.flow_b_heart_pass for record in records], dtype=np.bool_
+    )
+    flow_a_overall_pass_mask: npt.NDArray[np.bool_] = (
+        breath_pass_mask & heart_pass_mask
+    )
+    flow_b_overall_pass_mask: npt.NDArray[np.bool_] = np.array(
+        [record.flow_b_overall_pass for record in records], dtype=np.bool_
+    )
+    rmse_tolerance_rad: float = 1.0e-9
+    flow_a_lower_rmse_mask: npt.NDArray[np.bool_] = (
+        flow_a_rmse_rad < flow_b_rmse_rad - rmse_tolerance_rad
+    ) & method_1_failure_mask
+    flow_b_lower_rmse_mask: npt.NDArray[np.bool_] = (
+        flow_b_rmse_rad < flow_a_rmse_rad - rmse_tolerance_rad
+    ) & method_1_failure_mask
+    equal_rmse_mask: npt.NDArray[np.bool_] = (
+        ~(flow_a_lower_rmse_mask | flow_b_lower_rmse_mask)
+        & method_1_failure_mask
+    )
+
     report: str = "\n".join(
         [
             "FMCW Vital-Sign Batch Statistics",
@@ -485,6 +602,67 @@ def save_batch_results(
             (
                 "  Overall success (M2 -> M3):     "
                 f"{rate_change(method_2_overall_rate, method_3_overall_rate)}"
+            ),
+            "",
+            "Flow Comparison (Method 1 Failure Cases)",
+            "  Flow A: Method 1 -> Method 2 -> Method 3",
+            "  Flow B: Method 1 -> Method 3",
+            f"  Compared cases: {np.count_nonzero(method_1_failure_mask)}",
+            (
+                "  Recovery success A/B: "
+                f"{subset_success_rate(flow_a_recovery_mask, method_1_failure_mask):.2f}% / "
+                f"{subset_success_rate(flow_b_recovery_mask, method_1_failure_mask):.2f}%"
+            ),
+            (
+                "  Mean phase RMSE A/B: "
+                f"{masked_mean(flow_a_rmse_rad):.3f} / "
+                f"{masked_mean(flow_b_rmse_rad):.3f} rad"
+            ),
+            (
+                "  Mean wrong frames A/B: "
+                f"{masked_mean(flow_a_wrong_frames):.2f} / "
+                f"{masked_mean(flow_b_wrong_frames):.2f}"
+            ),
+            (
+                "  Mean branch changes A/B: "
+                f"{masked_mean(flow_a_branch_changes):.2f} / "
+                f"{masked_mean(flow_b_branch_changes):.2f}"
+            ),
+            (
+                "  Lower phase RMSE (A/B/Tie): "
+                f"{np.count_nonzero(flow_a_lower_rmse_mask)} / "
+                f"{np.count_nonzero(flow_b_lower_rmse_mask)} / "
+                f"{np.count_nonzero(equal_rmse_mask)}"
+            ),
+            (
+                "  Recovery only A/B: "
+                f"{np.count_nonzero(flow_a_recovery_mask & ~flow_b_recovery_mask & method_1_failure_mask)} / "
+                f"{np.count_nonzero(flow_b_recovery_mask & ~flow_a_recovery_mask & method_1_failure_mask)}"
+            ),
+            (
+                "  Respiration BPM success A/B: "
+                f"{subset_success_rate(breath_pass_mask, method_1_failure_mask):.2f}% / "
+                f"{subset_success_rate(flow_b_breath_pass_mask, method_1_failure_mask):.2f}%"
+            ),
+            (
+                "  Heartbeat BPM success A/B: "
+                f"{subset_success_rate(heart_pass_mask, method_1_failure_mask):.2f}% / "
+                f"{subset_success_rate(flow_b_heart_pass_mask, method_1_failure_mask):.2f}%"
+            ),
+            (
+                "  Overall BPM success A/B: "
+                f"{subset_success_rate(flow_a_overall_pass_mask, method_1_failure_mask):.2f}% / "
+                f"{subset_success_rate(flow_b_overall_pass_mask, method_1_failure_mask):.2f}%"
+            ),
+            (
+                "  Mean respiration error A/B: "
+                f"{masked_mean(breath_errors_bpm):.3f} / "
+                f"{masked_mean(flow_b_breath_errors_bpm):.3f} BPM"
+            ),
+            (
+                "  Mean heartbeat error A/B: "
+                f"{masked_mean(heart_errors_bpm):.3f} / "
+                f"{masked_mean(flow_b_heart_errors_bpm):.3f} BPM"
             ),
             "",
             "Respiration",
@@ -849,6 +1027,138 @@ def global_dynamic_programming_unwrap(
     return unwrapped_phase_rad
 
 
+def analyze_phase_flow(
+    extracted_phase_rad: FloatArray,
+    true_vibration_phase_rad: FloatArray,
+    config: RadarConfig,
+) -> PhaseFlowResult:
+    """以完全相同的指標與後處理評估一條 unwrap 流程。"""
+
+    two_pi: float = 2.0 * float(np.pi)
+    raw_phase_error_rad: FloatArray = (
+        extracted_phase_rad - true_vibration_phase_rad
+    )
+    global_branch_offset: int = int(
+        np.rint(np.median(raw_phase_error_rad) / two_pi)
+    )
+    aligned_phase_error_rad: FloatArray = (
+        extracted_phase_rad
+        - global_branch_offset * two_pi
+        - true_vibration_phase_rad
+    )
+    branch_error_index: npt.NDArray[np.int64] = np.rint(
+        aligned_phase_error_rad / two_pi
+    ).astype(np.int64)
+    branch_change_index: npt.NDArray[np.int64] = np.where(
+        np.diff(branch_error_index) != 0
+    )[0].astype(np.int64)
+    branch_change_frames: npt.NDArray[np.int64] = branch_change_index + 1
+
+    phase_offset_rad: float = float(np.median(raw_phase_error_rad))
+    recovery_error_rad: FloatArray = (
+        extracted_phase_rad - phase_offset_rad - true_vibration_phase_rad
+    )
+    phase_rmse_rad: float = float(np.sqrt(np.mean(np.square(recovery_error_rad))))
+    max_phase_error_rad: float = float(np.max(np.abs(recovery_error_rad)))
+    initial_phase_offset_rad: float = float(raw_phase_error_rad[0])
+    recovered_phase_rad: FloatArray = extracted_phase_rad - initial_phase_offset_rad
+    max_recovered_phase_step_rad: float = float(
+        np.max(np.abs(np.diff(extracted_phase_rad)))
+    )
+
+    true_phase_spectrum: FloatArray = np.abs(
+        np.fft.rfft(true_vibration_phase_rad - np.mean(true_vibration_phase_rad))
+    )
+    recovered_phase_spectrum: FloatArray = np.abs(
+        np.fft.rfft(extracted_phase_rad - np.mean(extracted_phase_rad))
+    )
+    if np.isclose(np.std(true_phase_spectrum), 0.0) or np.isclose(
+        np.std(recovered_phase_spectrum), 0.0
+    ):
+        fft_correlation: float = float("nan")
+    else:
+        fft_correlation = float(
+            np.corrcoef(true_phase_spectrum, recovered_phase_spectrum)[0, 1]
+        )
+
+    phase_vibration_rad: FloatArray = extracted_phase_rad - np.mean(
+        extracted_phase_rad
+    )
+    estimated_displacement_mm: FloatArray = (
+        phase_vibration_rad * config.wavelength_m / (4.0 * np.pi) * 1000.0
+    )
+    respiration_phase_rad: FloatArray = bandpass_filter(
+        signal=phase_vibration_rad,
+        sampling_rate_hz=config.frame_sampling_rate,
+        low_cut_hz=config.breath_cut_search_low_hz,
+        high_cut_hz=config.breath_cut_search_high_hz,
+        order=2,
+    )
+    heartbeat_phase_rad: FloatArray = bandpass_filter(
+        signal=phase_vibration_rad,
+        sampling_rate_hz=config.frame_sampling_rate,
+        low_cut_hz=config.heart_cut_search_low_hz,
+        high_cut_hz=config.heart_cut_search_high_hz,
+        order=2,
+    )
+    respiration_mm: FloatArray = (
+        respiration_phase_rad * config.wavelength_m / (4.0 * np.pi) * 1000.0
+    )
+    heartbeat_mm: FloatArray = (
+        heartbeat_phase_rad * config.wavelength_m / (4.0 * np.pi) * 1000.0
+    )
+
+    estimated_breath_frequency_hz: float
+    frequency_axis_hz: FloatArray
+    respiration_spectrum: FloatArray
+    (
+        estimated_breath_frequency_hz,
+        frequency_axis_hz,
+        respiration_spectrum,
+    ) = estimate_peak_frequency(
+        signal=respiration_mm,
+        sampling_rate_hz=config.frame_sampling_rate,
+        search_low_hz=config.breath_cut_search_low_hz,
+        search_high_hz=config.breath_cut_search_high_hz,
+    )
+    estimated_heart_frequency_hz: float
+    heartbeat_frequency_axis_hz: FloatArray
+    heartbeat_spectrum: FloatArray
+    (
+        estimated_heart_frequency_hz,
+        heartbeat_frequency_axis_hz,
+        heartbeat_spectrum,
+    ) = estimate_peak_frequency(
+        signal=heartbeat_mm,
+        sampling_rate_hz=config.frame_sampling_rate,
+        search_low_hz=config.heart_cut_search_low_hz,
+        search_high_hz=config.heart_cut_search_high_hz,
+    )
+    if not np.allclose(frequency_axis_hz, heartbeat_frequency_axis_hz):
+        raise RuntimeError("呼吸與心跳的頻率軸不一致。")
+
+    return PhaseFlowResult(
+        recovered_phase_rad=recovered_phase_rad,
+        branch_error_index=branch_error_index,
+        branch_change_frames=branch_change_frames,
+        estimated_displacement_mm=estimated_displacement_mm,
+        estimated_respiration_mm=respiration_mm,
+        estimated_heartbeat_mm=heartbeat_mm,
+        frequency_axis_hz=frequency_axis_hz,
+        respiration_spectrum=respiration_spectrum,
+        heartbeat_spectrum=heartbeat_spectrum,
+        estimated_breath_frequency_hz=estimated_breath_frequency_hz,
+        estimated_heart_frequency_hz=estimated_heart_frequency_hz,
+        recovery_succeeded=max_phase_error_rad < np.pi,
+        max_recovered_phase_step_rad=max_recovered_phase_step_rad,
+        phase_rmse_rad=phase_rmse_rad,
+        max_phase_error_rad=max_phase_error_rad,
+        actual_branch_change_count=int(branch_change_index.size),
+        wrong_branch_frame_count=int(np.count_nonzero(branch_error_index != 0)),
+        fft_correlation=fft_correlation,
+    )
+
+
 # -------------------------- Simulation and analysis ----------------------- #
 def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     """模擬 FMCW 雷達生命徵象訊號，並進行 Range FFT、相位解調與頻率估測。"""
@@ -952,10 +1262,11 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     true_phase_step_rad: FloatArray = np.diff(true_vibration_phase_rad)
     max_true_phase_step_rad: float = float(np.max(np.abs(true_phase_step_rad)))
 
-    used_kalman_unwrap: bool = max_true_phase_step_rad >= np.pi
+    used_kalman_unwrap: bool = max_true_phase_step_rad >= np.pi * 0.9
     kalman_recovery_succeeded: bool = True
     used_global_dp_unwrap: bool = False
     global_dp_recovery_succeeded: bool = False
+    global_dp_phase_rad: FloatArray | None = None
     if used_kalman_unwrap:
         print(
             "[方法 1 無效] 真實相鄰相位變化達到或超過 π；"
@@ -981,7 +1292,7 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
                 "以整段速度、加速度與平均位置成本重新選路。"
             )
             used_global_dp_unwrap = True
-            extracted_phase_rad = global_dynamic_programming_unwrap(
+            global_dp_phase_rad = global_dynamic_programming_unwrap(
                 wrapped_phase_rad,
                 branch_radius=config.global_dp_branch_radius,
                 velocity_weight=config.global_dp_velocity_weight,
@@ -989,11 +1300,62 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
                 drift_weight=config.global_dp_drift_weight,
                 reference_phase_rad=float(wrapped_phase_rad[0]),
             )
+            extracted_phase_rad = global_dp_phase_rad
     else:
         extracted_phase_rad = np.unwrap(wrapped_phase_rad)
 
+    # 流程 B：方法一失敗後不經 Kalman，直接以方法三恢復。
+    if used_kalman_unwrap:
+        if global_dp_phase_rad is None:
+            global_dp_phase_rad = global_dynamic_programming_unwrap(
+                wrapped_phase_rad,
+                branch_radius=config.global_dp_branch_radius,
+                velocity_weight=config.global_dp_velocity_weight,
+                acceleration_weight=config.global_dp_acceleration_weight,
+                drift_weight=config.global_dp_drift_weight,
+                reference_phase_rad=float(wrapped_phase_rad[0]),
+            )
+        direct_dp_phase_rad: FloatArray = global_dp_phase_rad
+    else:
+        direct_dp_phase_rad = extracted_phase_rad
+
+    two_pi: float = 2.0 * float(np.pi)
+    raw_phase_error_rad: FloatArray = (
+        extracted_phase_rad - true_vibration_phase_rad
+    )
+
+    # 去除整體固定的 2*pi offset，只統計相對於全域分支的選錯情況。
+    global_branch_offset: int = int(
+        np.rint(np.median(raw_phase_error_rad) / two_pi)
+    )
+    aligned_phase_error_rad: FloatArray = (
+        extracted_phase_rad
+        - global_branch_offset * two_pi
+        - true_vibration_phase_rad
+    )
+    branch_error_index: npt.NDArray[np.int64] = np.rint(
+        aligned_phase_error_rad / two_pi
+    ).astype(np.int64)
+    branch_change_index: npt.NDArray[np.int64] = np.where(
+        np.diff(branch_error_index) != 0
+    )[0].astype(np.int64)
+    # diff[i] 代表 i -> i+1 發生改變，所以實際由 frame i+1 開始。
+    branch_change_frames: npt.NDArray[np.int64] = branch_change_index + 1
+    actual_branch_change_count: int = int(
+        branch_change_index.size
+    )
+    wrong_branch_frame_count: int = int(
+        np.count_nonzero(branch_error_index != 0)
+    )
+
     phase_offset_rad: float = float(
         np.median(extracted_phase_rad - true_vibration_phase_rad)
+    )
+    initial_phase_offset_rad: float = float(
+        extracted_phase_rad[0] - true_vibration_phase_rad[0]
+    )
+    recovered_phase_rad: FloatArray = (
+        extracted_phase_rad - initial_phase_offset_rad
     )
     recovery_error_rad: FloatArray = (
         extracted_phase_rad - phase_offset_rad - true_vibration_phase_rad
@@ -1003,7 +1365,9 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     max_recovered_phase_step_rad: float = float(
         np.max(np.abs(np.diff(extracted_phase_rad)))
     )
-    cycle_slip_count: int = int(np.count_nonzero(np.abs(true_phase_step_rad) >= np.pi))
+    true_phase_risk_count: int = int(
+        np.count_nonzero(np.abs(true_phase_step_rad) >= np.pi)
+    )
     true_phase_spectrum: FloatArray = np.abs(
         np.fft.rfft(true_vibration_phase_rad - np.mean(true_vibration_phase_rad))
     )
@@ -1096,6 +1460,21 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     if not np.allclose(frequency_axis_hz, heartbeat_frequency_axis_hz):
         raise RuntimeError("呼吸與心跳的頻率軸不一致。")
 
+    direct_dp_flow: PhaseFlowResult = analyze_phase_flow(
+        extracted_phase_rad=direct_dp_phase_rad,
+        true_vibration_phase_rad=true_vibration_phase_rad,
+        config=config,
+    )
+    primary_flow_recovery_succeeded: bool = max_phase_error_rad < np.pi
+    if used_kalman_unwrap:
+        direct_dp_status: str = (
+            "成功" if direct_dp_flow.recovery_succeeded else "失敗"
+        )
+        print(
+            "[流程 B：M1 -> M3] 方法一失敗後直接使用方法三："
+            f"{direct_dp_status}。"
+        )
+
     return VitalSignResult(
         time_s=frame_time,
         range_axis_m=range_axis_m,
@@ -1104,6 +1483,10 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         ground_truth_breath_mm=ground_truth_breath_m * 1000.0,
         ground_truth_heart_mm=ground_truth_heart_m * 1000.0,
         ground_truth_total_mm=vibration_m * 1000.0,
+        true_vibration_phase_rad=true_vibration_phase_rad,
+        recovered_phase_rad=recovered_phase_rad,
+        branch_error_index=branch_error_index,
+        branch_change_frames=branch_change_frames,
         estimated_displacement_mm=estimated_displacement_mm,
         estimated_respiration_mm=respiration_mm,
         estimated_heartbeat_mm=heartbeat_mm,
@@ -1120,8 +1503,12 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         max_recovered_phase_step_rad=max_recovered_phase_step_rad,
         phase_rmse_rad=phase_rmse_rad,
         max_phase_error_rad=max_phase_error_rad,
-        cycle_slip_count=cycle_slip_count,
+        true_phase_risk_count=true_phase_risk_count,
+        actual_branch_change_count=actual_branch_change_count,
+        wrong_branch_frame_count=wrong_branch_frame_count,
         fft_correlation=fft_correlation,
+        primary_flow_recovery_succeeded=primary_flow_recovery_succeeded,
+        direct_dp_flow=direct_dp_flow,
     )
 
 
@@ -1517,6 +1904,165 @@ def plot_vital_sign_summary(
     )
 
 
+def plot_phase_branch_diagnostics(
+    result: VitalSignResult,
+    plot_config: PlotConfig,
+) -> None:
+    """繪製真實/恢復相位，並標出恢復結果切換 ``2*pi`` 分支的位置。"""
+
+    frame_axis: npt.NDArray[np.int64] = np.arange(
+        result.time_s.size,
+        dtype=np.int64,
+    )
+    fig, axis = plt.subplots(figsize=(14, 6))
+    axis.plot(
+        frame_axis,
+        result.true_vibration_phase_rad,
+        color="tab:blue",
+        linewidth=2.0,
+        label="True Phase",
+    )
+    axis.plot(
+        frame_axis,
+        result.recovered_phase_rad,
+        color="tab:orange",
+        linewidth=1.5,
+        label="Recovered Phase",
+    )
+    wrong_branch_mask: npt.NDArray[np.bool_] = result.branch_error_index != 0
+    fill_frame_values: list[float] = frame_axis.astype(np.float64).tolist()
+    fill_true_phase_values: list[float] = result.true_vibration_phase_rad.tolist()
+    fill_recovered_phase_values: list[float] = result.recovered_phase_rad.tolist()
+    fill_wrong_branch_mask: list[bool] = wrong_branch_mask.tolist()
+    axis.fill_between(
+        fill_frame_values,
+        fill_true_phase_values,
+        fill_recovered_phase_values,
+        where=fill_wrong_branch_mask,
+        color="red",
+        alpha=0.10,
+        label="Wrong Branch Frames",
+    )
+
+    for change_number, frame_number in enumerate(result.branch_change_frames):
+        frame: int = int(frame_number)
+        branch_step: int = int(
+            result.branch_error_index[frame] - result.branch_error_index[frame - 1]
+        )
+        branch_step_label: str = f"{branch_step:+d}×2π"
+        axis.axvline(
+            frame,
+            color="red",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.8,
+            label="Branch Change" if change_number == 0 else None,
+        )
+        axis.annotate(
+            f"Frame {frame}: {branch_step_label}",
+            xy=(frame, result.recovered_phase_rad[frame]),
+            xytext=(8, 18),
+            textcoords="offset points",
+            color="red",
+            fontsize=9,
+            arrowprops={"arrowstyle": "->", "color": "red", "alpha": 0.7},
+        )
+
+    axis.set_title("True Phase vs. Recovered Phase with Branch Changes")
+    axis.set_xlabel("Frame")
+    axis.set_ylabel("Phase (rad)")
+    axis.grid(True, linestyle="--", alpha=0.4)
+    axis.legend(loc="best")
+
+    save_or_show_figure(
+        figure=fig,
+        file_path=plot_config.output_dir / "03_phase_branch_diagnostics.png",
+        should_save=plot_config.save_phase_branch_diagnostics,
+        should_show=plot_config.show_figures,
+        dpi=plot_config.dpi,
+    )
+
+
+def plot_unwrap_flow_comparison(
+    result: VitalSignResult,
+    plot_config: PlotConfig,
+) -> None:
+    """比較 M1->M2->M3 與 M1->M3 兩條流程的相位及分支誤差。"""
+
+    frame_axis: npt.NDArray[np.int64] = np.arange(
+        result.time_s.size, dtype=np.int64
+    )
+    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(14, 10), sharex=True)
+
+    axes[0].plot(
+        frame_axis,
+        result.true_vibration_phase_rad,
+        color="black",
+        linewidth=2.0,
+        label="True Phase",
+    )
+    axes[0].plot(
+        frame_axis,
+        result.recovered_phase_rad,
+        color="tab:blue",
+        linewidth=1.5,
+        label="Flow A: M1 -> M2 -> M3",
+    )
+    axes[0].plot(
+        frame_axis,
+        result.direct_dp_flow.recovered_phase_rad,
+        color="tab:orange",
+        linestyle="--",
+        linewidth=1.5,
+        label="Flow B: M1 -> M3",
+    )
+    axes[0].set_title(
+        "Unwrap Flow Comparison "
+        f"(RMSE A/B = {result.phase_rmse_rad:.3f}/"
+        f"{result.direct_dp_flow.phase_rmse_rad:.3f} rad)"
+    )
+    axes[0].set_ylabel("Phase (rad)")
+    axes[0].grid(True, linestyle="--", alpha=0.4)
+    axes[0].legend(loc="best")
+
+    axes[1].step(
+        frame_axis,
+        result.branch_error_index,
+        where="post",
+        color="tab:blue",
+        linewidth=1.5,
+        label=(
+            "Flow A branch error "
+            f"({result.wrong_branch_frame_count} wrong frames)"
+        ),
+    )
+    axes[1].step(
+        frame_axis,
+        result.direct_dp_flow.branch_error_index,
+        where="post",
+        color="tab:orange",
+        linestyle="--",
+        linewidth=1.5,
+        label=(
+            "Flow B branch error "
+            f"({result.direct_dp_flow.wrong_branch_frame_count} wrong frames)"
+        ),
+    )
+    axes[1].axhline(0, color="black", linewidth=1.0, alpha=0.6)
+    axes[1].set_xlabel("Frame")
+    axes[1].set_ylabel("Branch Error Index")
+    axes[1].grid(True, linestyle="--", alpha=0.4)
+    axes[1].legend(loc="best")
+
+    save_or_show_figure(
+        figure=fig,
+        file_path=plot_config.output_dir / "04_unwrap_flow_comparison.png",
+        should_save=plot_config.save_flow_comparison,
+        should_show=plot_config.show_figures,
+        dpi=plot_config.dpi,
+    )
+
+
 def print_result_summary(
     config: RadarConfig,
     result: VitalSignResult,
@@ -1548,7 +2094,15 @@ def print_result_summary(
     print(f"RMSE Phase         : {result.phase_rmse_rad:.2f} rad")
     print(f"Max Error          : {result.max_phase_error_rad:.2f} rad")
     print()
-    print(f"Cycle Slip Count   : {result.cycle_slip_count}")
+    print(f"True Phase Risk Count : {result.true_phase_risk_count}")
+    print(f"Actual Branch Change Count : {result.actual_branch_change_count}")
+    print(f"Wrong Branch Frame Count   : {result.wrong_branch_frame_count}")
+    print("Branch Change Frames")
+    if result.branch_change_frames.size == 0:
+        print("  None")
+    else:
+        for frame_number in result.branch_change_frames:
+            print(f"  Frame {int(frame_number)}")
     print()
     print(f"FFT Corr           : {result.fft_correlation:.4f}")
     print()
@@ -1557,6 +2111,40 @@ def print_result_summary(
     print()
     print(f"Heart GT           : {original_heart_bpm:.2f} BPM")
     print(f"Heart Recover      : {estimated_heart_bpm:.2f} BPM")
+    if result.used_kalman_unwrap:
+        direct_dp_breath_bpm: float = (
+            result.direct_dp_flow.estimated_breath_frequency_hz * 60.0
+        )
+        direct_dp_heart_bpm: float = (
+            result.direct_dp_flow.estimated_heart_frequency_hz * 60.0
+        )
+        print()
+        print("Flow Comparison")
+        print("  A: Method 1 -> Method 2 -> Method 3")
+        print("  B: Method 1 -> Method 3")
+        print(
+            "  Recovery A/B       : "
+            f"{result.primary_flow_recovery_succeeded} / "
+            f"{result.direct_dp_flow.recovery_succeeded}"
+        )
+        print(
+            "  Phase RMSE A/B     : "
+            f"{result.phase_rmse_rad:.3f} / "
+            f"{result.direct_dp_flow.phase_rmse_rad:.3f} rad"
+        )
+        print(
+            "  Wrong Frames A/B   : "
+            f"{result.wrong_branch_frame_count} / "
+            f"{result.direct_dp_flow.wrong_branch_frame_count}"
+        )
+        print(
+            "  Breath BPM A/B     : "
+            f"{estimated_breath_bpm:.2f} / {direct_dp_breath_bpm:.2f}"
+        )
+        print(
+            "  Heart BPM A/B      : "
+            f"{estimated_heart_bpm:.2f} / {direct_dp_heart_bpm:.2f}"
+        )
     print("=" * 70 + "\n")
 
 
@@ -1591,6 +2179,18 @@ def main() -> None:
         )
         heart_absolute_error_bpm: float = abs(
             estimated_heart_bpm - run_config.heart_frequency_bpm
+        )
+        flow_b_estimated_breath_bpm: float = (
+            result.direct_dp_flow.estimated_breath_frequency_hz * 60.0
+        )
+        flow_b_estimated_heart_bpm: float = (
+            result.direct_dp_flow.estimated_heart_frequency_hz * 60.0
+        )
+        flow_b_breath_absolute_error_bpm: float = abs(
+            flow_b_estimated_breath_bpm - run_config.breath_frequency_bpm
+        )
+        flow_b_heart_absolute_error_bpm: float = abs(
+            flow_b_estimated_heart_bpm - run_config.heart_frequency_bpm
         )
         bpm_resolution: float = (
             run_config.frame_sampling_rate / run_config.frame_length * 60.0
@@ -1627,12 +2227,48 @@ def main() -> None:
                 max_recovered_phase_step_rad=(result.max_recovered_phase_step_rad),
                 phase_rmse_rad=result.phase_rmse_rad,
                 max_phase_error_rad=result.max_phase_error_rad,
-                cycle_slip_count=result.cycle_slip_count,
+                true_phase_risk_count=result.true_phase_risk_count,
+                actual_branch_change_count=result.actual_branch_change_count,
+                wrong_branch_frame_count=result.wrong_branch_frame_count,
                 fft_correlation=result.fft_correlation,
                 bpm_resolution=bpm_resolution,
                 target_range_bin=result.target_range_bin,
                 estimated_range_m=estimated_range_m,
                 range_absolute_error_m=abs(estimated_range_m - run_config.distance_m),
+                flow_a_recovery_succeeded=(
+                    result.primary_flow_recovery_succeeded
+                ),
+                flow_b_recovery_succeeded=(
+                    result.direct_dp_flow.recovery_succeeded
+                ),
+                flow_b_phase_rmse_rad=result.direct_dp_flow.phase_rmse_rad,
+                flow_b_max_phase_error_rad=(
+                    result.direct_dp_flow.max_phase_error_rad
+                ),
+                flow_b_actual_branch_change_count=(
+                    result.direct_dp_flow.actual_branch_change_count
+                ),
+                flow_b_wrong_branch_frame_count=(
+                    result.direct_dp_flow.wrong_branch_frame_count
+                ),
+                flow_b_estimated_breath_bpm=flow_b_estimated_breath_bpm,
+                flow_b_estimated_heart_bpm=flow_b_estimated_heart_bpm,
+                flow_b_breath_absolute_error_bpm=(
+                    flow_b_breath_absolute_error_bpm
+                ),
+                flow_b_heart_absolute_error_bpm=(
+                    flow_b_heart_absolute_error_bpm
+                ),
+                flow_b_breath_pass=(
+                    flow_b_breath_absolute_error_bpm <= bpm_resolution
+                ),
+                flow_b_heart_pass=(
+                    flow_b_heart_absolute_error_bpm <= bpm_resolution
+                ),
+                flow_b_overall_pass=(
+                    flow_b_breath_absolute_error_bpm <= bpm_resolution
+                    and flow_b_heart_absolute_error_bpm <= bpm_resolution
+                ),
             )
         )
 
@@ -1663,6 +2299,14 @@ def main() -> None:
             )
             plot_vital_sign_summary(
                 config=run_config,
+                result=result,
+                plot_config=plot_config,
+            )
+            plot_phase_branch_diagnostics(
+                result=result,
+                plot_config=plot_config,
+            )
+            plot_unwrap_flow_comparison(
                 result=result,
                 plot_config=plot_config,
             )
