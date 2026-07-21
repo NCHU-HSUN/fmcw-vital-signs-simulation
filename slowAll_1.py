@@ -62,6 +62,12 @@ class RadarConfig:
     heart_cut_search_low_bpm: float = 48.0
     heart_cut_search_high_bpm: float = 120.0
 
+    # ---------------------- 方法 3：全域動態規劃 --------------------- #
+    global_dp_branch_radius: int = 8
+    global_dp_velocity_weight: float = 1.0
+    global_dp_acceleration_weight: float = 4.0
+    global_dp_drift_weight: float = 0.05
+
     @property
     def wavelength_m(self) -> float:
         return self.c / self.fc
@@ -176,6 +182,8 @@ class VitalSignResult:
     estimated_heart_frequency_hz: float
     used_kalman_unwrap: bool
     kalman_recovery_succeeded: bool
+    used_global_dp_unwrap: bool
+    global_dp_recovery_succeeded: bool
     max_true_phase_step_rad: float
     max_recovered_phase_step_rad: float
     phase_rmse_rad: float
@@ -206,6 +214,8 @@ class BatchRunRecord:
     overall_pass: bool
     used_kalman_unwrap: bool
     kalman_recovery_succeeded: bool
+    used_global_dp_unwrap: bool
+    global_dp_recovery_succeeded: bool
     max_true_phase_step_rad: float
     max_recovered_phase_step_rad: float
     phase_rmse_rad: float
@@ -374,7 +384,26 @@ def save_batch_results(
         ],
         dtype=np.bool_,
     )
-    effective_mask: npt.NDArray[np.bool_] = method_1_mask | method_2_success_mask
+    method_3_success_mask: npt.NDArray[np.bool_] = np.array(
+        [
+            record.used_global_dp_unwrap and record.global_dp_recovery_succeeded
+            for record in records
+        ],
+        dtype=np.bool_,
+    )
+    method_3_failure_mask: npt.NDArray[np.bool_] = np.array(
+        [
+            record.used_global_dp_unwrap and not record.global_dp_recovery_succeeded
+            for record in records
+        ],
+        dtype=np.bool_,
+    )
+    method_2_effective_mask: npt.NDArray[np.bool_] = (
+        method_1_mask | method_2_success_mask
+    )
+    method_3_effective_mask: npt.NDArray[np.bool_] = (
+        method_2_effective_mask | method_3_success_mask
+    )
     breath_pass_mask: npt.NDArray[np.bool_] = np.array(
         [record.breath_pass for record in records], dtype=np.bool_
     )
@@ -394,10 +423,23 @@ def save_batch_results(
     method_1_overall_rate: float = subset_success_rate(
         breath_pass_mask & heart_pass_mask, method_1_mask
     )
-    method_2_breath_rate: float = subset_success_rate(breath_pass_mask, effective_mask)
-    method_2_heart_rate: float = subset_success_rate(heart_pass_mask, effective_mask)
+    method_2_breath_rate: float = subset_success_rate(
+        breath_pass_mask, method_2_effective_mask
+    )
+    method_2_heart_rate: float = subset_success_rate(
+        heart_pass_mask, method_2_effective_mask
+    )
     method_2_overall_rate: float = subset_success_rate(
-        breath_pass_mask & heart_pass_mask, effective_mask
+        breath_pass_mask & heart_pass_mask, method_2_effective_mask
+    )
+    method_3_breath_rate: float = subset_success_rate(
+        breath_pass_mask, method_3_effective_mask
+    )
+    method_3_heart_rate: float = subset_success_rate(
+        heart_pass_mask, method_3_effective_mask
+    )
+    method_3_overall_rate: float = subset_success_rate(
+        breath_pass_mask & heart_pass_mask, method_3_effective_mask
     )
 
     def rate_change(before: float, after: float) -> str:
@@ -416,11 +458,34 @@ def save_batch_results(
             f"  Method 1 valid cases:                 {np.count_nonzero(method_1_mask)}",
             f"  Method 2 added valid cases:          {np.count_nonzero(method_2_success_mask)}",
             f"  Method 2 recovery failures analyzed: {np.count_nonzero(method_2_failure_mask)}",
-            f"  Valid cases after Method 2:          {np.count_nonzero(effective_mask)}",
+            f"  Method 3 added valid cases:          {np.count_nonzero(method_3_success_mask)}",
+            f"  Method 3 recovery failures analyzed: {np.count_nonzero(method_3_failure_mask)}",
+            f"  Valid cases after Method 3:          {np.count_nonzero(method_3_effective_mask)}",
             f"  Cases completing Pass/Fail:          {len(records)}",
-            f"  Respiration success: {rate_change(method_1_breath_rate, method_2_breath_rate)}",
-            f"  Heartbeat success:   {rate_change(method_1_heart_rate, method_2_heart_rate)}",
-            f"  Overall success:     {rate_change(method_1_overall_rate, method_2_overall_rate)}",
+            (
+                "  Respiration success (M1 -> M2): "
+                f"{rate_change(method_1_breath_rate, method_2_breath_rate)}"
+            ),
+            (
+                "  Respiration success (M2 -> M3): "
+                f"{rate_change(method_2_breath_rate, method_3_breath_rate)}"
+            ),
+            (
+                "  Heartbeat success (M1 -> M2):   "
+                f"{rate_change(method_1_heart_rate, method_2_heart_rate)}"
+            ),
+            (
+                "  Heartbeat success (M2 -> M3):   "
+                f"{rate_change(method_2_heart_rate, method_3_heart_rate)}"
+            ),
+            (
+                "  Overall success (M1 -> M2):     "
+                f"{rate_change(method_1_overall_rate, method_2_overall_rate)}"
+            ),
+            (
+                "  Overall success (M2 -> M3):     "
+                f"{rate_change(method_2_overall_rate, method_3_overall_rate)}"
+            ),
             "",
             "Respiration",
             f"  Mean absolute error: {np.mean(breath_errors_bpm):.3f} BPM",
@@ -583,6 +648,7 @@ def kalman_assisted_unwrap(wrapped_phase_rad: FloatArray) -> FloatArray:
         [[0.05, 0.0], [0.0, 0.50]], dtype=np.float64
     )
     measurement_variance: float = 0.05
+    two_pi: float = 2.0 * float(np.pi)
     state: FloatArray = np.array([wrapped_phase_rad[0], 0.0], dtype=np.float64)
     covariance: FloatArray = np.diag([measurement_variance, 4.0]).astype(np.float64)
     unwrapped_phase_rad: FloatArray = np.empty_like(wrapped_phase_rad)
@@ -594,12 +660,12 @@ def kalman_assisted_unwrap(wrapped_phase_rad: FloatArray) -> FloatArray:
             transition @ covariance @ transition.T + process_covariance
         )
         predicted_phase_rad: float = float(predicted_state[0])
-        branch_offset: float = float(
-            np.round((predicted_phase_rad - wrapped_phase_rad[index]) / (2.0 * np.pi))
-        )
-        measurement_rad: float = float(
-            wrapped_phase_rad[index] + branch_offset * 2.0 * np.pi
-        )
+        wrapped_measurement_rad: float = float(wrapped_phase_rad[index])
+        phase_branch_ratio: float = (
+            predicted_phase_rad - wrapped_measurement_rad
+        ) / two_pi
+        branch_offset: int = round(phase_branch_ratio)
+        measurement_rad: float = wrapped_measurement_rad + branch_offset * two_pi
         innovation_rad: float = measurement_rad - predicted_phase_rad
         innovation_variance: float = float(
             (observation @ predicted_covariance @ observation.T)[0, 0]
@@ -613,6 +679,172 @@ def kalman_assisted_unwrap(wrapped_phase_rad: FloatArray) -> FloatArray:
             np.eye(2, dtype=np.float64) - kalman_gain @ observation
         ) @ predicted_covariance
         unwrapped_phase_rad[index] = measurement_rad
+
+    return unwrapped_phase_rad
+
+
+def global_dynamic_programming_unwrap(
+    wrapped_phase_rad: FloatArray,
+    *,
+    branch_radius: int = 8,
+    velocity_weight: float = 1.0,
+    acceleration_weight: float = 4.0,
+    drift_weight: float = 0.05,
+    reference_phase_rad: float | None = None,
+) -> FloatArray:
+    """以整段訊號的最小成本路徑選擇每點的 ``2*pi*k`` 分支。
+
+    動態規劃狀態保留連續兩點的分支，因此能同時計算相位速度與
+    相位加速度成本。速度與加速度不受整條路徑共同加減 ``2*pi``
+    影響；回溯後再選擇最佳的共同偏移，使長時間平均相位最接近
+    ``reference_phase_rad``。
+    """
+
+    sample_count: int = wrapped_phase_rad.size
+    if sample_count == 0:
+        return wrapped_phase_rad.copy()
+    if branch_radius < 1:
+        raise ValueError("branch_radius 必須至少為 1。")
+    if velocity_weight < 0.0 or acceleration_weight < 0.0 or drift_weight < 0.0:
+        raise ValueError("動態規劃的成本權重不可為負數。")
+
+    two_pi: float = 2.0 * float(np.pi)
+    reference_phase: float = (
+        float(wrapped_phase_rad[0])
+        if reference_phase_rad is None
+        else float(reference_phase_rad)
+    )
+
+    if sample_count == 1:
+        branch_offset: int = round(
+            (reference_phase - float(wrapped_phase_rad[0])) / two_pi
+        )
+        return wrapped_phase_rad + branch_offset * two_pi
+
+    branch_numbers: npt.NDArray[np.int64] = np.arange(
+        -branch_radius,
+        branch_radius + 1,
+        dtype=np.int64,
+    )
+    branch_count: int = branch_numbers.size
+    candidate_phase_rad: FloatArray = (
+        wrapped_phase_rad[:, np.newaxis]
+        + two_pi * branch_numbers[np.newaxis, :]
+    )
+
+    # 固定第一點 k=0 只是在去除全域 2*pi 不定性；回溯後會再補回
+    # 最符合長時間平均位置限制的共同分支偏移。
+    zero_branch_index: int = branch_radius
+    path_cost: FloatArray = np.full(
+        (branch_count, branch_count),
+        np.inf,
+        dtype=np.float64,
+    )
+    first_velocity_rad: FloatArray = (
+        candidate_phase_rad[1] - candidate_phase_rad[0, zero_branch_index]
+    )
+    path_cost[zero_branch_index, :] = velocity_weight * np.square(
+        first_velocity_rad
+    )
+
+    predecessor_tables: list[npt.NDArray[np.int64]] = []
+    for sample_index in range(2, sample_count):
+        next_cost: FloatArray = np.full_like(path_cost, np.inf)
+        predecessor: npt.NDArray[np.int64] = np.full(
+            (branch_count, branch_count),
+            -1,
+            dtype=np.int64,
+        )
+
+        for previous_branch in range(branch_count):
+            velocity_rad: FloatArray = (
+                candidate_phase_rad[sample_index]
+                - candidate_phase_rad[sample_index - 1, previous_branch]
+            )
+            acceleration_rad: FloatArray = (
+                candidate_phase_rad[sample_index][np.newaxis, :]
+                - 2.0 * candidate_phase_rad[sample_index - 1, previous_branch]
+                + candidate_phase_rad[sample_index - 2, :, np.newaxis]
+            )
+            transition_cost: FloatArray = (
+                path_cost[:, previous_branch, np.newaxis]
+                + velocity_weight * np.square(velocity_rad)[np.newaxis, :]
+                + acceleration_weight * np.square(acceleration_rad)
+            )
+            best_predecessor: npt.NDArray[np.int64] = np.argmin(
+                transition_cost,
+                axis=0,
+            ).astype(np.int64)
+            next_cost[previous_branch, :] = transition_cost[
+                best_predecessor,
+                np.arange(branch_count),
+            ]
+            predecessor[previous_branch, :] = best_predecessor
+
+        path_cost = next_cost
+        predecessor_tables.append(predecessor)
+
+    # 漂移項是整段訊號的終端成本。先對每組終點保留下來的最佳
+    # 動態路徑計算平均相位，再連同速度/加速度成本選出全域終點。
+    terminal_cost: FloatArray = path_cost.copy()
+    if drift_weight > 0.0:
+        for previous_branch in range(branch_count):
+            for current_branch in range(branch_count):
+                if not np.isfinite(path_cost[previous_branch, current_branch]):
+                    continue
+                terminal_path: npt.NDArray[np.int64] = np.empty(
+                    sample_count,
+                    dtype=np.int64,
+                )
+                terminal_path[-2] = previous_branch
+                terminal_path[-1] = current_branch
+                for sample_index in range(sample_count - 1, 1, -1):
+                    terminal_path[sample_index - 2] = predecessor_tables[
+                        sample_index - 2
+                    ][
+                        terminal_path[sample_index - 1],
+                        terminal_path[sample_index],
+                    ]
+                terminal_phase_rad: FloatArray = candidate_phase_rad[
+                    np.arange(sample_count),
+                    terminal_path,
+                ]
+                common_branch_offset: int = round(
+                    (reference_phase - float(np.mean(terminal_phase_rad))) / two_pi
+                )
+                mean_phase_rad: float = float(np.mean(terminal_phase_rad)) + (
+                    common_branch_offset * two_pi
+                )
+                terminal_cost[previous_branch, current_branch] += (
+                    drift_weight * (mean_phase_rad - reference_phase) ** 2
+                )
+
+    previous_branch: int
+    current_branch: int
+    previous_branch, current_branch = (
+        int(index)
+        for index in np.unravel_index(np.argmin(terminal_cost), terminal_cost.shape)
+    )
+    best_path: npt.NDArray[np.int64] = np.empty(sample_count, dtype=np.int64)
+    best_path[-2] = previous_branch
+    best_path[-1] = current_branch
+
+    for sample_index in range(sample_count - 1, 1, -1):
+        best_path[sample_index - 2] = predecessor_tables[sample_index - 2][
+            best_path[sample_index - 1],
+            best_path[sample_index],
+        ]
+
+    unwrapped_phase_rad: FloatArray = candidate_phase_rad[
+        np.arange(sample_count),
+        best_path,
+    ]
+
+    if drift_weight > 0.0:
+        common_branch_offset: int = round(
+            (reference_phase - float(np.mean(unwrapped_phase_rad))) / two_pi
+        )
+        unwrapped_phase_rad = unwrapped_phase_rad + common_branch_offset * two_pi
 
     return unwrapped_phase_rad
 
@@ -722,12 +954,41 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
 
     used_kalman_unwrap: bool = max_true_phase_step_rad >= np.pi
     kalman_recovery_succeeded: bool = True
+    used_global_dp_unwrap: bool = False
+    global_dp_recovery_succeeded: bool = False
     if used_kalman_unwrap:
         print(
             "[方法 1 無效] 真實相鄰相位變化達到或超過 π；"
             "改用方法 2 Kalman-assisted unwrap。"
         )
-        extracted_phase_rad: FloatArray = kalman_assisted_unwrap(wrapped_phase_rad)
+        kalman_phase_rad: FloatArray = kalman_assisted_unwrap(wrapped_phase_rad)
+        kalman_phase_offset_rad: float = float(
+            np.median(kalman_phase_rad - true_vibration_phase_rad)
+        )
+        kalman_error_rad: FloatArray = (
+            kalman_phase_rad - kalman_phase_offset_rad - true_vibration_phase_rad
+        )
+        kalman_recovery_succeeded = (
+            float(np.max(np.abs(kalman_error_rad))) < np.pi
+        )
+
+        if kalman_recovery_succeeded:
+            extracted_phase_rad = kalman_phase_rad
+            print("[方法 2 恢復成功] 繼續後續估算。")
+        else:
+            print(
+                "[方法 2 恢復失敗] 改用方法 3 全域動態規劃，"
+                "以整段速度、加速度與平均位置成本重新選路。"
+            )
+            used_global_dp_unwrap = True
+            extracted_phase_rad = global_dynamic_programming_unwrap(
+                wrapped_phase_rad,
+                branch_radius=config.global_dp_branch_radius,
+                velocity_weight=config.global_dp_velocity_weight,
+                acceleration_weight=config.global_dp_acceleration_weight,
+                drift_weight=config.global_dp_drift_weight,
+                reference_phase_rad=float(wrapped_phase_rad[0]),
+            )
     else:
         extracted_phase_rad = np.unwrap(wrapped_phase_rad)
 
@@ -758,13 +1019,14 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
             np.corrcoef(true_phase_spectrum, recovered_phase_spectrum)[0, 1]
         )
 
-    if used_kalman_unwrap:
-        kalman_recovery_succeeded = max_phase_error_rad < np.pi
-        if kalman_recovery_succeeded:
-            print("[方法 2 恢復成功] 繼續後續估算。")
+    if used_global_dp_unwrap:
+        global_dp_recovery_succeeded = max_phase_error_rad < np.pi
+        if global_dp_recovery_succeeded:
+            print("[方法 3 恢復成功] 已用全域最低成本路徑繼續後續估算。")
         else:
             print(
-                "[方法 2 恢復失敗] 仍保留異常結果，" "繼續後續估算與 Pass/Fail 分析。"
+                "[方法 3 恢復失敗] 仍保留全域最低成本結果，"
+                "繼續後續估算與 Pass/Fail 分析。"
             )
 
     phase_vibration_rad: FloatArray = extracted_phase_rad - np.mean(extracted_phase_rad)
@@ -852,6 +1114,8 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         estimated_heart_frequency_hz=estimated_heart_frequency_hz,
         used_kalman_unwrap=used_kalman_unwrap,
         kalman_recovery_succeeded=kalman_recovery_succeeded,
+        used_global_dp_unwrap=used_global_dp_unwrap,
+        global_dp_recovery_succeeded=global_dp_recovery_succeeded,
         max_true_phase_step_rad=max_true_phase_step_rad,
         max_recovered_phase_step_rad=max_recovered_phase_step_rad,
         phase_rmse_rad=phase_rmse_rad,
@@ -1264,10 +1528,19 @@ def print_result_summary(
 
     estimated_breath_bpm: float = result.estimated_breath_frequency_hz * 60.0
     estimated_heart_bpm: float = result.estimated_heart_frequency_hz * 60.0
+    unwrap_method: str
+    if result.used_global_dp_unwrap:
+        unwrap_method = "Method 3: Global dynamic programming"
+    elif result.used_kalman_unwrap:
+        unwrap_method = "Method 2: Kalman-assisted unwrap"
+    else:
+        unwrap_method = "Method 1: numpy.unwrap"
+
     print("\n" + "=" * 70)
     print("FMCW Radar Vital Sign Estimation Result")
     print("=" * 70)
     print(f"Seed               : {config.random_seed}")
+    print(f"Unwrap Method      : {unwrap_method}")
     print()
     print(f"Max Δφ True        : {result.max_true_phase_step_rad:.2f} rad")
     print(f"Max Δφ Recover     : {result.max_recovered_phase_step_rad:.2f} rad")
@@ -1288,7 +1561,7 @@ def print_result_summary(
 
 
 def main() -> None:
-    num_runs: int = 100
+    num_runs: int = 10000
     output_dir: Path = Path("output")
     batch_records: list[BatchRunRecord] = []
 
@@ -1346,6 +1619,10 @@ def main() -> None:
                 ),
                 used_kalman_unwrap=result.used_kalman_unwrap,
                 kalman_recovery_succeeded=(result.kalman_recovery_succeeded),
+                used_global_dp_unwrap=result.used_global_dp_unwrap,
+                global_dp_recovery_succeeded=(
+                    result.global_dp_recovery_succeeded
+                ),
                 max_true_phase_step_rad=result.max_true_phase_step_rad,
                 max_recovered_phase_step_rad=(result.max_recovered_phase_step_rad),
                 phase_rmse_rad=result.phase_rmse_rad,
@@ -1398,15 +1675,26 @@ def main() -> None:
         for record in batch_records
     )
     method_2_failure_count: int = sum(
-        record.used_kalman_unwrap and not record.kalman_recovery_succeeded
+        record.used_global_dp_unwrap
+        for record in batch_records
+    )
+    method_3_added_count: int = sum(
+        record.used_global_dp_unwrap and record.global_dp_recovery_succeeded
+        for record in batch_records
+    )
+    method_3_failure_count: int = sum(
+        record.used_global_dp_unwrap and not record.global_dp_recovery_succeeded
         for record in batch_records
     )
     print("\nUnwrap 方法比較：")
     print(f"  方法 1 原本有效：       {method_1_valid_count} 次")
     print(f"  方法 2 增加有效：       {method_2_added_count} 次")
-    print(f"  方法 2 恢復失敗：       {method_2_failure_count} 次（仍納入分析）")
+    print(f"  方法 2 恢復失敗：       {method_2_failure_count} 次（轉交方法 3）")
+    print(f"  方法 3 增加有效：       {method_3_added_count} 次")
+    print(f"  方法 3 恢復失敗：       {method_3_failure_count} 次（仍納入分析）")
     print(
-        "  加入方法 2 後總有效：  " f"{method_1_valid_count + method_2_added_count} 次"
+        "  加入方法 3 後總有效：  "
+        f"{method_1_valid_count + method_2_added_count + method_3_added_count} 次"
     )
     print(f"  完成 Pass/Fail：         {len(batch_records)} 次")
 
