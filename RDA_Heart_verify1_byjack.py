@@ -19,7 +19,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 "參數設定"
 c: float = 3e+8;
-fc: float = 60e+9;                         # IWRL6432 是 60GHz 頻段 (原本寫 77G)
+fc: float = 77e+9;                         # 77GHz 頻段
 k: float = 75e+12;                         # 斜率 75 MHz/us = 75e6 / 1e-6 = 75e12 Hz/s
 #------------------- Fast Time (單個 Chirp 內部的採樣) --------------------
 Tc: float = 10.24e-6;                      # 時間週期,  S*R_Fs = 10.24 us (256 * 40 ns)
@@ -52,20 +52,20 @@ frame_len: int = 128;
 # frame_time = (0:frame_len-1)*frame_periodicity;
 frame_time = np.arange(0, frame_len * frame_periodicity, frame_periodicity, dtype=float);
 #----------------------------- 反射訊號參數 -------------------------------
-distance: float = 1.42;                     # 目標距離雷達 0m
-velocity: float = 0;                        # 目標距離雷達的相對速度 0m/s
+distance: float = 1.196;                     # 目標距離雷達 0m
+velocity: float = -0.090;                        # 目標距離雷達的相對速度 0m/s
 #----------------------- 生命徵象參數 (加入心跳呼吸) -----------------------
 # 呼吸 (2mm, 0.25Hz)
 # breat_amp = 2e-3;
 # breat_freq = 0.25;
-breat_amp: float = 1.2418793510369426e-3;
-breat_freq: float = 27.19336936820566/60;
+breat_amp: float = 3.862e-3;
+breat_freq: float = 17.618/60;
 
 # 心跳 (0.5mm, 1.2Hz)
 # heart_amp = 0.5e-3;
 # heart_freq = 3.0;
-heart_amp: float = 0.7812428486283749e-3;
-heart_freq: float = 110.22506116681888/60;
+heart_amp: float = 0.477e-3;
+heart_freq: float = 119.669/60;
 #----------------------------- 陣列天線參數 -------------------------------
 M: int = 1;                                     # 接收天線數目
 N: int = 1;                                     # 發射天線數目
@@ -214,8 +214,10 @@ resp_band = (f1 >= 0.1) & (f1 <= 0.5)
 heart_band = (f1 >= 0.8) & (f1 <= 3.0)
 estimated_resp_freq = f1[resp_band][np.argmax(fft_resp[resp_band])]
 estimated_heart_freq = f1[heart_band][np.argmax(fft_heart[heart_band])]
-print(f"估計呼吸頻率：{estimated_resp_freq*60:.3f} BPM")
-print(f"估計心跳頻率：{estimated_heart_freq*60:.3f} BPM")
+print("預設參數：")
+print(f"頻率:{fc/1e9} GHz, 距離:{distance:.3f} m, 速度:{velocity:.3f} m/s")
+print(f"估計呼吸頻率：{estimated_resp_freq*60:.3f} BPM,實際呼吸頻率：{breat_freq*60:.3f} BPM")
+print(f"估計心跳頻率：{estimated_heart_freq*60:.3f} BPM,實際心跳頻率：{heart_freq*60:.3f} BPM")
 
 # --- 繪製圖 2：呼吸頻譜 ---
 fig_resp = plt.figure(num=3, figsize=(8, 4))
