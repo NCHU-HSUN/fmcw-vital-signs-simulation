@@ -201,8 +201,8 @@ class RadarConfig:
     num_loops: int = 1
 
     # -------------------------- Frame Time --------------------------- #
-    frame_periodicity: float = 80.0e-3
-    frame_length: int = 128
+    frame_periodicity: float = 50.0e-3
+    frame_length: int = 256
 
     # --------------------------- 目標參數 ----------------------------- #
     distance_m: float = 1.0
@@ -330,16 +330,13 @@ class PlotConfig:
     show_figures: bool = True
     dpi: int = 300
 
-    # FMCW 發射 / 接收 / IF 波形
-    save_fmcw_waveform: bool = True
-
     # Range Profile、位移、濾波結果、頻譜合併圖
     save_vital_sign_summary: bool = True
 
     # True / Recovered phase 與分支變更位置
     save_phase_branch_diagnostics: bool = True
 
-    # Range FFT pick 位置及擷取後的 slow-time amplitude
+    # Picked bin 的 wrapped phase 與 extracted phase
     save_picked_range_bin_data: bool = True
 
 
@@ -357,6 +354,7 @@ class VitalSignResult:
     ground_truth_heart_mm: FloatArray
     ground_truth_total_mm: FloatArray
     true_vibration_phase_rad: FloatArray
+    extracted_phase_rad: FloatArray
     recovered_phase_rad: FloatArray
     branch_error_index: npt.NDArray[np.int64]
     branch_change_frames: npt.NDArray[np.int64]
@@ -1147,6 +1145,7 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         ground_truth_heart_mm=ground_truth_heart_m * 1000.0,
         ground_truth_total_mm=vibration_m * 1000.0,
         true_vibration_phase_rad=true_vibration_phase_rad,
+        extracted_phase_rad=extracted_phase_rad,
         recovered_phase_rad=recovered_phase_rad,
         branch_error_index=branch_error_index,
         branch_change_frames=branch_change_frames,
@@ -1174,22 +1173,10 @@ def plot_picked_range_bin_data(
     result: VitalSignResult,
     plot_config: PlotConfig,
 ) -> None:
-    """顯示 Range FFT pick 位置及該 bin 的 slow-time amplitude。"""
+    """顯示 picked bin 的 wrapped phase 與 extracted phase。"""
 
-    positive_range_bin_count: int = result.range_profile.shape[0] // 2
-    positive_range_axis_m: FloatArray = result.range_axis_m[
-        :positive_range_bin_count
-    ]
-    average_range_magnitude: FloatArray = np.mean(
-        np.abs(result.range_profile[:positive_range_bin_count, :]),
-        axis=1,
-    )
-    target_range_m: float = float(result.range_axis_m[result.target_range_bin])
-    picked_slow_time_amplitude: FloatArray = np.abs(
+    picked_slow_time_phase_rad: FloatArray = np.angle(
         result.picked_slow_time_signal
-    )
-    picked_range_magnitude: float = float(
-        average_range_magnitude[result.target_range_bin]
     )
 
     fig, axes = plt.subplots(
@@ -1199,54 +1186,36 @@ def plot_picked_range_bin_data(
     )
 
     axes[0].plot(
-        positive_range_axis_m,
-        average_range_magnitude,
-        color="tab:blue",
+        result.time_s,
+        picked_slow_time_phase_rad,
+        color="tab:green",
         linewidth=1.5,
-        label="Mean Range FFT Magnitude",
+        label="Picked-bin wrapped phase",
     )
-    axes[0].plot(
-        target_range_m,
-        picked_range_magnitude,
-        marker="o",
-        markersize=9,
-        color="red",
-        label=(
-            f"Picked Bin = {result.target_range_bin}, "
-            f"Range = {target_range_m:.3f} m"
-        ),
-    )
-    axes[0].axvline(
-        target_range_m,
-        color="red",
-        linestyle="--",
-        linewidth=1.2,
-        alpha=0.7,
-    )
-    axes[0].set_title("Range FFT and Picked Range Bin")
-    axes[0].set_xlabel("Range (m)")
-    axes[0].set_ylabel("Mean magnitude")
+    axes[0].set_title("Wrapped Phase from the Picked Range Bin")
+    axes[0].set_xlabel("Slow time / frame time (s)")
+    axes[0].set_ylabel("Wrapped phase (rad)")
+    axes[0].set_ylim(-np.pi, np.pi)
     axes[0].grid(True, linestyle="--", alpha=0.4)
     axes[0].legend(loc="upper right")
 
     axes[1].plot(
         result.time_s,
-        picked_slow_time_amplitude,
-        color="tab:green",
+        result.extracted_phase_rad,
+        color="tab:blue",
         linewidth=1.5,
-        label="Picked-bin amplitude",
+        label="Extracted phase (np.unwrap)",
     )
-    axes[1].set_title(
-        "Slow-Time Signal Extracted from the Picked Range Bin"
-    )
+    axes[1].set_title("Extracted Phase after NumPy Unwrap")
     axes[1].set_xlabel("Slow time / frame time (s)")
-    axes[1].set_ylabel("Amplitude |Range FFT|")
+    axes[1].set_ylabel("Extracted phase (rad)")
     axes[1].grid(True, linestyle="--", alpha=0.4)
     axes[1].legend(loc="upper right")
 
     figure_title: FigureTitleProtocol = cast(FigureTitleProtocol, fig)
     figure_title.suptitle(
-        "Range FFT Peak Picking and Extracted Slow-Time Signal",
+        f"Picked Range Bin {result.target_range_bin}: "
+        "Wrapped and Extracted Phase",
         fontsize=15,
         fontweight="bold",
     )
@@ -1258,112 +1227,6 @@ def plot_picked_range_bin_data(
         should_show=plot_config.show_figures,
         dpi=plot_config.dpi,
     )
-def plot_transmitted_fmcw_waveform(
-    config: RadarConfig,
-    plot_config: PlotConfig,
-) -> None:
-    """繪製一個 frame 中尚未混頻的 FMCW 發射 RF 波形。"""
-
-    chirps_per_frame: int = config.chirps_per_loop * config.num_loops
-    active_frame_duration_s: float = chirps_per_frame * config.chirp_period
-    capture_duration_s: float = config.frame_length * config.frame_periodicity
-    frame_start_times_s: FloatArray = (
-        np.arange(config.frame_length, dtype=np.float64) * config.frame_periodicity
-    )
-
-    transmit_gate_time_s: list[float] = []
-    transmit_gate_amplitude: list[float] = []
-
-    for frame_start_s in frame_start_times_s:
-        for chirp_index in range(chirps_per_frame):
-            chirp_start_s: float = frame_start_s + chirp_index * config.chirp_period
-            chirp_end_s: float = chirp_start_s + config.chirp_duration
-            transmit_gate_time_s.extend(
-                [chirp_start_s, chirp_start_s, chirp_end_s, chirp_end_s]
-            )
-            transmit_gate_amplitude.extend([0.0, 1.0, 1.0, 0.0])
-
-    transmit_gate_time: FloatArray = np.array(
-        transmit_gate_time_s,
-        dtype=np.float64,
-    )
-    transmit_gate: FloatArray = np.array(
-        transmit_gate_amplitude,
-        dtype=np.float64,
-    )
-
-    fig, axes = plt.subplots(
-        nrows=2,
-        ncols=1,
-        figsize=(12, 8),
-    )
-
-    axes[1].plot(
-        transmit_gate_time,
-        transmit_gate,
-        color="#007C7C",
-        linewidth=1.5,
-    )
-    axes[1].set_title("Transmit Gate Across the Complete Slow-Time Capture")
-    axes[1].set_xlabel("Slow time (s)")
-    axes[1].set_ylabel("Transmit enabled")
-    axes[1].set_ylim(-0.15, 1.15)
-    axes[1].set_yticks([0.0, 1.0])
-    axes[1].grid(True, linestyle="--", alpha=0.5)
-
-    for chirp_index in range(chirps_per_frame):
-        chirp_start_s: float = chirp_index * config.chirp_period
-        chirp_end_s: float = chirp_start_s + config.chirp_duration
-        chirp_frequency_ghz: FloatArray = (
-            np.array(
-                [config.fc, config.fc + config.bandwidth_hz],
-                dtype=np.float64,
-            )
-            / 1.0e9
-        )
-
-        axes[0].plot(
-            np.array([chirp_start_s, chirp_end_s]) * 1.0e6,
-            chirp_frequency_ghz,
-            color="#007C7C",
-            linewidth=1.8,
-        )
-        axes[0].plot(
-            np.full(2, chirp_end_s * 1.0e6),
-            chirp_frequency_ghz[::-1],
-            color="#007C7C",
-            linewidth=1.2,
-        )
-        axes[0].axvspan(
-            chirp_end_s * 1.0e6,
-            (chirp_start_s + config.chirp_period) * 1.0e6,
-            color="lightgray",
-            alpha=0.35,
-        )
-
-    axes[0].set_title("FMCW Transmit Frequency Across All Chirps in Frame 1")
-    axes[0].set_xlabel("Time within active frame burst (µs)")
-    axes[0].set_ylabel("Transmit frequency (GHz)")
-    axes[0].grid(True, linestyle="--", alpha=0.5)
-
-    figure_title: FigureTitleProtocol = cast(FigureTitleProtocol, fig)
-    figure_title.suptitle(
-        "FMCW Transmit Timing and Frequency Before IF Mixing and Range FFT "
-        f"({config.frame_length} Frames, {capture_duration_s:.2f} s Capture, "
-        f"{active_frame_duration_s * 1.0e6:.2f} µs Active per Frame)",
-        fontsize=15,
-        fontweight="bold",
-    )
-
-    save_or_show_figure(
-        figure=fig,
-        file_path=plot_config.output_dir / "01_fmcw_transmit_waveform.png",
-        should_save=plot_config.save_fmcw_waveform,
-        should_show=plot_config.show_figures,
-        dpi=plot_config.dpi,
-    )
-
-
 def plot_vital_sign_summary(
     config: RadarConfig,
     result: VitalSignResult,
@@ -1834,7 +1697,6 @@ def main() -> None:
             plot_config = PlotConfig(
                 output_dir=output_dir,
                 show_figures=False,
-                save_fmcw_waveform=True,
                 save_vital_sign_summary=True,
             )
             save_waveform_viewer_config(
@@ -1850,11 +1712,7 @@ def main() -> None:
             #     output_dir=output_dir,
             # )
 
-            # 僅儲存第一次測試的 FMCW、picked-bin 與生命徵象圖。
-            plot_transmitted_fmcw_waveform(
-                config=run_config,
-                plot_config=plot_config,
-            )
+            # 僅儲存第一次測試的 picked-bin 與生命徵象圖。
             plot_vital_sign_summary(
                 config=run_config,
                 result=result,
