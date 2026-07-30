@@ -5,6 +5,7 @@ import csv
 from functools import lru_cache
 import json
 from pathlib import Path
+from typing import Literal, Protocol, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,6 +16,169 @@ from scipy.signal import butter, sosfiltfilt, sosfreqz
 
 FloatArray = npt.NDArray[np.float64]
 ComplexArray = npt.NDArray[np.complex128]
+
+
+class FigureSaveProtocol(Protocol):
+    """補足 Matplotlib ``Figure.savefig`` 缺少的靜態型別資訊。"""
+
+    def savefig(
+        self,
+        file_path: Path,
+        *,
+        dpi: int,
+        bbox_inches: str,
+    ) -> None: ...
+
+
+class FigureTitleProtocol(Protocol):
+    """補足 Matplotlib ``Figure.suptitle`` 缺少的靜態型別資訊。"""
+
+    def suptitle(
+        self,
+        title: str,
+        *,
+        fontsize: int,
+        fontweight: str,
+    ) -> object: ...
+
+
+class ColorbarProtocol(Protocol):
+    """此程式使用的 Colorbar 最小介面。"""
+
+    def set_label(self, label: str) -> None: ...
+
+
+class RangeTimeAxesProtocol(Protocol):
+    """此程式繪製 3D Range-Time 圖所需的座標軸介面。"""
+
+    def plot_surface(
+        self,
+        x: FloatArray,
+        y: FloatArray,
+        z: FloatArray,
+        *,
+        cmap: str,
+        vmin: float,
+        vmax: float,
+        rcount: int,
+        ccount: int,
+        linewidth: float,
+        antialiased: bool,
+    ) -> object: ...
+
+    def plot(
+        self,
+        x: FloatArray,
+        y: FloatArray,
+        z: FloatArray,
+        *,
+        color: str,
+        linewidth: float,
+        label: str,
+    ) -> object: ...
+
+    def set_title(self, title: str, *, fontsize: int) -> object: ...
+
+    def set_xlabel(self, label: str) -> object: ...
+
+    def set_ylabel(self, label: str) -> object: ...
+
+    def set_zlabel(self, label: str) -> object: ...
+
+    def set_zlim(self, lower: float, upper: float) -> object: ...
+
+    def view_init(self, *, elev: float, azim: float) -> None: ...
+
+    def set_box_aspect(self, aspect: tuple[float, float, float]) -> None: ...
+
+    def legend(self, *, loc: str) -> object: ...
+
+
+class RangeTimeFigureProtocol(FigureTitleProtocol, Protocol):
+    """此程式建立 3D 座標軸與 Colorbar 所需的 Figure 介面。"""
+
+    def add_subplot(
+        self,
+        rows: int,
+        columns: int,
+        index: int,
+        *,
+        projection: Literal["3d"],
+    ) -> RangeTimeAxesProtocol: ...
+
+    def colorbar(
+        self,
+        mappable: object,
+        *,
+        ax: RangeTimeAxesProtocol,
+        shrink: float,
+        pad: float,
+    ) -> ColorbarProtocol: ...
+
+
+class PhaseAxesProtocol(Protocol):
+    """相位分支診斷圖所需的 2D 座標軸介面。"""
+
+    def plot(
+        self,
+        x: npt.ArrayLike,
+        y: npt.ArrayLike,
+        *,
+        color: str,
+        linewidth: float,
+        label: str,
+    ) -> object: ...
+
+    def fill_between(
+        self,
+        x: list[float],
+        y1: list[float],
+        y2: list[float],
+        *,
+        where: list[bool],
+        color: str,
+        alpha: float,
+        label: str,
+    ) -> object: ...
+
+    def axvline(
+        self,
+        x: int,
+        *,
+        color: str,
+        linestyle: str,
+        linewidth: float,
+        alpha: float,
+        label: str | None,
+    ) -> object: ...
+
+    def annotate(
+        self,
+        text: str,
+        *,
+        xy: tuple[int, float],
+        xytext: tuple[int, int],
+        textcoords: str,
+        color: str,
+        fontsize: int,
+        arrowprops: dict[str, str | float],
+    ) -> object: ...
+
+    def set_title(self, title: str) -> object: ...
+
+    def set_xlabel(self, label: str) -> object: ...
+
+    def set_ylabel(self, label: str) -> object: ...
+
+    def grid(
+        self,
+        *,
+        visible: bool,
+        linestyle: str,
+        alpha: float,
+    ) -> None: ...
+
+    def legend(self, *, loc: str) -> object: ...
 
 
 # ------------------------------- Data models ------------------------------ #
@@ -61,6 +225,7 @@ class RadarConfig:
     breath_cut_search_high_bpm: float = 30.0
     heart_cut_search_low_bpm: float = 48.0
     heart_cut_search_high_bpm: float = 120.0
+    breath_heart_diff_bpm: float = 21.0
 
     # 搜尋範圍邊界經過雙向 Butterworth 濾波後，允許的最大衰減。
     filter_order: int = 2
@@ -116,25 +281,42 @@ class RadarConfig:
         run_seed: int = self.random_seed + run_index
         rng: np.random.Generator = np.random.default_rng(run_seed)
 
+        distance_m: float = float(rng.uniform(0.5, 2.0))
+        velocity_mps: float = float(rng.uniform(-0.1, 0.1))
+        breath_amplitude_m: float = float(rng.uniform(1.0e-3, 4.0e-3))
+        breath_frequency_bpm: float = float(
+            rng.uniform(
+                self.breath_cut_search_low_bpm,
+                self.breath_cut_search_high_bpm,
+            )
+        )
+        heart_frequency_low_bpm: float = max(
+            self.heart_cut_search_low_bpm,
+            breath_frequency_bpm + self.breath_heart_diff_bpm,
+        )
+        if heart_frequency_low_bpm > self.heart_cut_search_high_bpm:
+            raise ValueError(
+                "心跳 BPM 搜尋上限不足以滿足心跳至少比呼吸快 "
+                f"{self.breath_heart_diff_bpm:.1f} BPM 的條件。"
+            )
+        heart_amplitude_m: float = float(rng.uniform(0.2e-3, 0.8e-3))
+        heart_frequency_bpm: float = float(
+            rng.uniform(
+                heart_frequency_low_bpm,
+                self.heart_cut_search_high_bpm,
+            )
+        )
+        snr_db: float = float(rng.uniform(10.0, 30.0))
+
         return replace(
             self,
-            distance_m=float(rng.uniform(0.5, 2.0)),
-            velocity_mps=float(rng.uniform(-0.1, 0.1)),
-            breath_amplitude_m=float(rng.uniform(1.0e-3, 4.0e-3)),
-            breath_frequency_bpm=float(
-                rng.uniform(
-                    self.breath_cut_search_low_bpm,
-                    self.breath_cut_search_high_bpm,
-                )
-            ),
-            heart_amplitude_m=float(rng.uniform(0.2e-3, 0.8e-3)),
-            heart_frequency_bpm=float(
-                rng.uniform(
-                    self.heart_cut_search_low_bpm,
-                    self.heart_cut_search_high_bpm,
-                )
-            ),
-            snr_db=float(rng.uniform(10.0, 30.0)),
+            distance_m=distance_m,
+            velocity_mps=velocity_mps,
+            breath_amplitude_m=breath_amplitude_m,
+            breath_frequency_bpm=breath_frequency_bpm,
+            heart_amplitude_m=heart_amplitude_m,
+            heart_frequency_bpm=heart_frequency_bpm,
+            snr_db=snr_db,
             add_noise=True,
             random_seed=run_seed,
         )
@@ -157,8 +339,8 @@ class PlotConfig:
     # True / Recovered phase 與分支變更位置
     save_phase_branch_diagnostics: bool = True
 
-    # Range FFT 強度隨距離與 frame time 的 3D 圖
-    save_range_time_3d: bool = True
+    # Range FFT pick 位置及擷取後的 slow-time amplitude
+    save_picked_range_bin_data: bool = True
 
 
 @dataclass(frozen=True)
@@ -169,6 +351,7 @@ class VitalSignResult:
     range_axis_m: FloatArray
     range_profile: ComplexArray
     target_range_bin: int
+    picked_slow_time_signal: ComplexArray
 
     ground_truth_breath_mm: FloatArray
     ground_truth_heart_mm: FloatArray
@@ -438,7 +621,8 @@ def save_or_show_figure(
 
     if should_save:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(  # pyright: ignore[reportUnknownMemberType]
+        typed_figure: FigureSaveProtocol = cast(FigureSaveProtocol, figure)
+        typed_figure.savefig(
             file_path,
             dpi=dpi,
             bbox_inches="tight",
@@ -639,7 +823,7 @@ def estimate_peak_from_spectrum(
     search_high_hz: float,
     require_strict_local_peak: bool = False,
 ) -> float:
-    """回傳搜尋範圍最大值，或依振幅排序後的第一個嚴格局部 peak。"""
+    """將搜尋範圍兩端各擴一格後，回傳最大值或第一個嚴格局部 peak。"""
 
     valid_mask: npt.NDArray[np.bool_] = (frequency_axis_hz >= search_low_hz) & (
         frequency_axis_hz <= search_high_hz
@@ -650,15 +834,26 @@ def estimate_peak_from_spectrum(
     if valid_indices.size == 0:
         raise ValueError("指定頻率搜尋範圍內沒有 FFT bin。")
 
+    last_spectrum_index: int = magnitude_spectrum.size - 1
+    expanded_start_index: int = max(int(valid_indices[0]) - 1, 0)
+    expanded_end_index: int = min(
+        int(valid_indices[-1]) + 1,
+        last_spectrum_index,
+    )
+    expanded_indices: npt.NDArray[np.int64] = np.arange(
+        expanded_start_index,
+        expanded_end_index + 1,
+        dtype=np.int64,
+    )
+
     if require_strict_local_peak:
         descending_order: npt.NDArray[np.int64] = np.argsort(
-            magnitude_spectrum[valid_indices]
+            magnitude_spectrum[expanded_indices]
         )[::-1].astype(np.int64)
-        sorted_candidate_indices: npt.NDArray[np.int64] = valid_indices[
+        sorted_candidate_indices: npt.NDArray[np.int64] = expanded_indices[
             descending_order
         ]
 
-        last_spectrum_index: int = magnitude_spectrum.size - 1
         for candidate_index_value in sorted_candidate_indices:
             candidate_index: int = int(candidate_index_value)
             if candidate_index == 0 or candidate_index == last_spectrum_index:
@@ -679,8 +874,8 @@ def estimate_peak_from_spectrum(
             ):
                 return float(frequency_axis_hz[candidate_index])
 
-    local_peak_index: int = int(np.argmax(magnitude_spectrum[valid_indices]))
-    peak_index: int = int(valid_indices[local_peak_index])
+    local_peak_index: int = int(np.argmax(magnitude_spectrum[expanded_indices]))
+    peak_index: int = int(expanded_indices[local_peak_index])
 
     return float(frequency_axis_hz[peak_index])
 
@@ -780,8 +975,11 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
     )
 
     # ------------------------- Range Bin 相位擷取 --------------------------- #
-    target_complex_data: ComplexArray = range_profile[target_range_bin, :]
-    wrapped_phase_rad: FloatArray = np.angle(target_complex_data)
+    picked_slow_time_signal: ComplexArray = range_profile[
+        target_range_bin,
+        :,
+    ].copy()
+    wrapped_phase_rad: FloatArray = np.angle(picked_slow_time_signal)
     true_vibration_phase_rad: FloatArray = (
         4.0 * np.pi * vibration_m / config.wavelength_m
     )
@@ -944,6 +1142,7 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
         range_axis_m=range_axis_m,
         range_profile=range_profile,
         target_range_bin=target_range_bin,
+        picked_slow_time_signal=picked_slow_time_signal,
         ground_truth_breath_mm=ground_truth_breath_m * 1000.0,
         ground_truth_heart_mm=ground_truth_heart_m * 1000.0,
         ground_truth_total_mm=vibration_m * 1000.0,
@@ -971,101 +1170,94 @@ def simulate_and_process(config: RadarConfig) -> VitalSignResult:
 
 
 # --------------------------------- Plotting -------------------------------- #
-def plot_range_time_3d(
+def plot_picked_range_bin_data(
     result: VitalSignResult,
     plot_config: PlotConfig,
 ) -> None:
-    """繪製可觀察目標距離、跨 frame 穩定度與雜訊底的 3D Range-Time 圖。"""
+    """顯示 Range FFT pick 位置及該 bin 的 slow-time amplitude。"""
 
     positive_range_bin_count: int = result.range_profile.shape[0] // 2
     positive_range_axis_m: FloatArray = result.range_axis_m[
         :positive_range_bin_count
     ]
-    positive_range_profile: ComplexArray = result.range_profile[
-        :positive_range_bin_count,
-        :,
-    ]
-
-    range_magnitude: FloatArray = np.abs(positive_range_profile)
-    maximum_magnitude: float = float(np.max(range_magnitude))
-    normalized_magnitude_db: FloatArray = 20.0 * np.log10(
-        np.maximum(range_magnitude / maximum_magnitude, 1.0e-6)
+    average_range_magnitude: FloatArray = np.mean(
+        np.abs(result.range_profile[:positive_range_bin_count, :]),
+        axis=1,
     )
-
     target_range_m: float = float(result.range_axis_m[result.target_range_bin])
+    picked_slow_time_amplitude: FloatArray = np.abs(
+        result.picked_slow_time_signal
+    )
+    picked_range_magnitude: float = float(
+        average_range_magnitude[result.target_range_bin]
+    )
 
-    range_grid_m: FloatArray
-    frame_time_grid_s: FloatArray
-    range_grid_m, frame_time_grid_s = np.meshgrid(
+    fig, axes = plt.subplots(
+        nrows=2,
+        ncols=1,
+        figsize=(14, 9),
+    )
+
+    axes[0].plot(
         positive_range_axis_m,
-        result.time_s,
+        average_range_magnitude,
+        color="tab:blue",
+        linewidth=1.5,
+        label="Mean Range FFT Magnitude",
     )
-
-    fig = plt.figure(figsize=(14, 9))
-    range_time_ax = fig.add_subplot(1, 1, 1, projection="3d")
-    surface = range_time_ax.plot_surface(
-        range_grid_m,
-        frame_time_grid_s,
-        normalized_magnitude_db.T,
-        cmap="viridis",
-        vmin=-60.0,
-        vmax=0.0,
-        rcount=result.time_s.size,
-        ccount=positive_range_axis_m.size,
-        linewidth=0.0,
-        antialiased=True,
-    )
-
-    target_bin_magnitude_db: FloatArray = normalized_magnitude_db[
-        result.target_range_bin,
-        :,
-    ]
-    range_time_ax.plot(
-        np.full(result.time_s.shape, target_range_m),
-        result.time_s,
-        target_bin_magnitude_db,
+    axes[0].plot(
+        target_range_m,
+        picked_range_magnitude,
+        marker="o",
+        markersize=9,
         color="red",
-        linewidth=2.2,
-        label=f"Detected target: {target_range_m:.2f} m",
+        label=(
+            f"Picked Bin = {result.target_range_bin}, "
+            f"Range = {target_range_m:.3f} m"
+        ),
     )
-
-    range_time_ax.set_title(
-        "Complete Positive-Range 3D Range-Time Intensity "
-        f"({positive_range_axis_m.size} Bins × {result.time_s.size} Frames)\n"
-        "Peak ridge = detected target, lower surface = noise floor",
-        fontsize=14,
+    axes[0].axvline(
+        target_range_m,
+        color="red",
+        linestyle="--",
+        linewidth=1.2,
+        alpha=0.7,
     )
-    range_time_ax.set_xlabel("Range (m)")
-    range_time_ax.set_ylabel("Slow time / frame time (s)")
-    range_time_ax.set_zlabel("Normalized Range FFT magnitude (dB)")
-    range_time_ax.set_zlim(-60.0, 0.0)
-    range_time_ax.view_init(elev=30.0, azim=-125.0)
-    range_time_ax.set_box_aspect((1.25, 1.5, 0.8))
-    range_time_ax.legend(loc="upper right")
+    axes[0].set_title("Range FFT and Picked Range Bin")
+    axes[0].set_xlabel("Range (m)")
+    axes[0].set_ylabel("Mean magnitude")
+    axes[0].grid(True, linestyle="--", alpha=0.4)
+    axes[0].legend(loc="upper right")
 
-    magnitude_colorbar = fig.colorbar(
-        surface,
-        ax=range_time_ax,
-        shrink=0.68,
-        pad=0.08,
+    axes[1].plot(
+        result.time_s,
+        picked_slow_time_amplitude,
+        color="tab:green",
+        linewidth=1.5,
+        label="Picked-bin amplitude",
     )
-    magnitude_colorbar.set_label("Normalized Range FFT magnitude (dB)")
+    axes[1].set_title(
+        "Slow-Time Signal Extracted from the Picked Range Bin"
+    )
+    axes[1].set_xlabel("Slow time / frame time (s)")
+    axes[1].set_ylabel("Amplitude |Range FFT|")
+    axes[1].grid(True, linestyle="--", alpha=0.4)
+    axes[1].legend(loc="upper right")
 
-    fig.suptitle(
-        "Target Range Information Extracted from the Final IF Signal",
+    figure_title: FigureTitleProtocol = cast(FigureTitleProtocol, fig)
+    figure_title.suptitle(
+        "Range FFT Peak Picking and Extracted Slow-Time Signal",
         fontsize=15,
         fontweight="bold",
     )
 
     save_or_show_figure(
         figure=fig,
-        file_path=plot_config.output_dir / "04_range_time_3d.png",
-        should_save=plot_config.save_range_time_3d,
+        file_path=plot_config.output_dir / "04_picked_range_bin_data.png",
+        should_save=plot_config.save_picked_range_bin_data,
         should_show=plot_config.show_figures,
         dpi=plot_config.dpi,
     )
-
-
 def plot_transmitted_fmcw_waveform(
     config: RadarConfig,
     plot_config: PlotConfig,
@@ -1100,38 +1292,24 @@ def plot_transmitted_fmcw_waveform(
         dtype=np.float64,
     )
 
-    # 60 GHz RF 訊號週期極短，因此只放大顯示 chirp 起始的 0.2 ns。
-    waveform_duration_s: float = 0.2e-9
-    waveform_time: FloatArray = np.linspace(
-        0.0,
-        waveform_duration_s,
-        num=2_000,
-        dtype=np.float64,
-    )
-    transmitted_signal: FloatArray = np.cos(
-        2.0
-        * np.pi
-        * (config.fc * waveform_time + 0.5 * config.chirp_slope * waveform_time**2)
-    )
-
     fig, axes = plt.subplots(
-        nrows=3,
+        nrows=2,
         ncols=1,
-        figsize=(12, 11),
+        figsize=(12, 8),
     )
 
-    axes[0].plot(
+    axes[1].plot(
         transmit_gate_time,
         transmit_gate,
         color="#007C7C",
         linewidth=1.5,
     )
-    axes[0].set_title("Transmit Gate Across the Complete Slow-Time Capture")
-    axes[0].set_xlabel("Slow time (s)")
-    axes[0].set_ylabel("Transmit enabled")
-    axes[0].set_ylim(-0.15, 1.15)
-    axes[0].set_yticks([0.0, 1.0])
-    axes[0].grid(True, linestyle="--", alpha=0.5)
+    axes[1].set_title("Transmit Gate Across the Complete Slow-Time Capture")
+    axes[1].set_xlabel("Slow time (s)")
+    axes[1].set_ylabel("Transmit enabled")
+    axes[1].set_ylim(-0.15, 1.15)
+    axes[1].set_yticks([0.0, 1.0])
+    axes[1].grid(True, linestyle="--", alpha=0.5)
 
     for chirp_index in range(chirps_per_frame):
         chirp_start_s: float = chirp_index * config.chirp_period
@@ -1144,44 +1322,33 @@ def plot_transmitted_fmcw_waveform(
             / 1.0e9
         )
 
-        axes[1].plot(
+        axes[0].plot(
             np.array([chirp_start_s, chirp_end_s]) * 1.0e6,
             chirp_frequency_ghz,
             color="#007C7C",
             linewidth=1.8,
         )
-        axes[1].plot(
+        axes[0].plot(
             np.full(2, chirp_end_s * 1.0e6),
             chirp_frequency_ghz[::-1],
             color="#007C7C",
             linewidth=1.2,
         )
-        axes[1].axvspan(
+        axes[0].axvspan(
             chirp_end_s * 1.0e6,
             (chirp_start_s + config.chirp_period) * 1.0e6,
             color="lightgray",
             alpha=0.35,
         )
 
-    axes[1].set_title("FMCW Transmit Frequency Across All Chirps in Frame 1")
-    axes[1].set_xlabel("Time within active frame burst (µs)")
-    axes[1].set_ylabel("Transmit frequency (GHz)")
-    axes[1].grid(True, linestyle="--", alpha=0.5)
+    axes[0].set_title("FMCW Transmit Frequency Across All Chirps in Frame 1")
+    axes[0].set_xlabel("Time within active frame burst (µs)")
+    axes[0].set_ylabel("Transmit frequency (GHz)")
+    axes[0].grid(True, linestyle="--", alpha=0.5)
 
-    axes[2].plot(
-        waveform_time * 1.0e9,
-        transmitted_signal,
-        color="#D99000",
-        linewidth=1.2,
-    )
-    axes[2].set_title("FMCW Transmit RF Waveform (First 0.2 ns of Chirp 1)")
-    axes[2].set_xlabel("Time within chirp (ns)")
-    axes[2].set_ylabel("Normalized amplitude")
-    axes[2].set_ylim(-1.1, 1.1)
-    axes[2].grid(True, linestyle="--", alpha=0.5)
-
-    fig.suptitle(
-        "FMCW Transmit Signal Before IF Mixing and Range FFT "
+    figure_title: FigureTitleProtocol = cast(FigureTitleProtocol, fig)
+    figure_title.suptitle(
+        "FMCW Transmit Timing and Frequency Before IF Mixing and Range FFT "
         f"({config.frame_length} Frames, {capture_duration_s:.2f} s Capture, "
         f"{active_frame_duration_s * 1.0e6:.2f} µs Active per Frame)",
         fontsize=15,
@@ -1435,7 +1602,8 @@ def plot_vital_sign_summary(
     spectrum_ax.legend(loc="upper right", fontsize=8)
 
     # 整張圖標題
-    fig.suptitle(  # pyright: ignore[reportUnknownMemberType]
+    figure_title: FigureTitleProtocol = cast(FigureTitleProtocol, fig)
+    figure_title.suptitle(
         "FMCW Radar Vital Sign Detection Summary",
         fontsize=16,
         fontweight="bold",
@@ -1467,7 +1635,8 @@ def plot_phase_branch_diagnostics(
         result.time_s.size,
         dtype=np.int64,
     )
-    fig, axis = plt.subplots(figsize=(14, 6))
+    fig, matplotlib_axis = plt.subplots(figsize=(14, 6))
+    axis: PhaseAxesProtocol = cast(PhaseAxesProtocol, matplotlib_axis)
     axis.plot(
         frame_axis,
         result.true_vibration_phase_rad,
@@ -1524,7 +1693,7 @@ def plot_phase_branch_diagnostics(
     axis.set_title("True Phase vs. Recovered Phase with Branch Changes")
     axis.set_xlabel("Frame")
     axis.set_ylabel("Phase (rad)")
-    axis.grid(True, linestyle="--", alpha=0.4)
+    axis.grid(visible=True, linestyle="--", alpha=0.4)
     axis.legend(loc="best")
 
     save_or_show_figure(
@@ -1667,7 +1836,6 @@ def main() -> None:
                 show_figures=False,
                 save_fmcw_waveform=True,
                 save_vital_sign_summary=True,
-                save_range_time_3d=True,
             )
             save_waveform_viewer_config(
                 config=run_config,
@@ -1682,7 +1850,7 @@ def main() -> None:
             #     output_dir=output_dir,
             # )
 
-            # 僅儲存第一次測試的 FMCW、Range-Time 與生命徵象圖。
+            # 僅儲存第一次測試的 FMCW、picked-bin 與生命徵象圖。
             plot_transmitted_fmcw_waveform(
                 config=run_config,
                 plot_config=plot_config,
@@ -1696,7 +1864,7 @@ def main() -> None:
                 result=result,
                 plot_config=plot_config,
             )
-            plot_range_time_3d(
+            plot_picked_range_bin_data(
                 result=result,
                 plot_config=plot_config,
             )
